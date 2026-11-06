@@ -9,6 +9,7 @@ import hashlib, posixpath, re, shlex, tempfile, zipfile
 from pathlib import Path
 
 from porter import datapack
+PIPELINES = 'vk_pipelines.bin'; PIPE_MAGIC = b'PPE1'   # (gfx_vk_exec.c PIPE_MAGIC 0x31455050, little-endian)
 from porter.adb import Adb, AdbError, long_path
 from porter.upstream import BuildError, PROG, say
 
@@ -87,6 +88,20 @@ def apk_asks_access(apk):   # whether the APK asks for All files access: one mad
     return ACCESS.encode('utf-16-le') in m or ACCESS.encode() in m
 
 
+def harvest_pipelines(adb, files, dest):
+    """The pipeline list an earlier install recorded on the device (gfx_vk_exec.c: vk_pipelines.bin) into dest beside the data pack, when it is longer than the
+    one there: the next port packs it as the seed list (datapack SEED_PIPELINES), and that install's first launch, a fresh install or another driver starts warm"""
+    with tempfile.TemporaryDirectory() as t:
+        got = Path(t) / PIPELINES
+        try: adb.run('pull', f'{files}/{PIPELINES}', str(got), check=False, retries=1)
+        except AdbError: return
+        if not got.is_file() or got.stat().st_size <= 8 or got.read_bytes()[:4] != PIPE_MAGIC: return
+        mine = Path(dest) / PIPELINES
+        if mine.is_file() and mine.stat().st_size >= got.stat().st_size: return
+        Path(dest).mkdir(parents=True, exist_ok=True); mine.write_bytes(got.read_bytes())
+        say(f'shader list: {got.stat().st_size // 1024} KB from the device saved to {mine} (the next port packs it, so its first launch starts warm)')
+
+
 def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None, romfs_push=False):
     """romfs_at: a folder on the device that holds the game's RomFS (romfs_push: push the pack's RomFS into it first), 'app' for the app's files folder, None: as the
     device has it (an earlier --romfs-at install's folder, else the files folder)"""
@@ -105,6 +120,7 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         dev = adb.pick()
         model = adb.prop('ro.product.model')
         say(f'device: {model or dev} ({dev}), GPU {adb.gpu() or "unknown"}')
+        harvest_pipelines(adb, files, Path(data).parent)
         if 'bcn' in man.get('requires', []):   # the profile's requires: BC-compressed textures
             bc = adb.bc_textures()
             if bc is False: raise BuildError(f'{man["name"]} needs BC-compressed textures, which this device\'s GPU ({adb.gpu()}) cannot read')

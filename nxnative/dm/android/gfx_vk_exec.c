@@ -910,12 +910,20 @@ static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here
     if (g_precq_n < PREC_Q) g_precq[g_precq_n++] = *k;   // (a full queue drops the record: that pipeline is only not prewarmed next time)
     pthread_cond_signal(&g_precq_cv); pthread_mutex_unlock(&g_precq_mu);
 }
-static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
+static pkey *g_pw; static size_t g_pw_n, g_pw_own; static volatile size_t g_pw_next, g_pw_done, g_pw_seen;
+static _Atomic int g_pw_live, g_pw_block;   // threads still building; the build at launch is on (the screen shows its progress)
+int dm_prewarm_progress(size_t *seen, size_t *total) {   // gfx_vk_present.c: 1 while the build at launch runs
+    if (!atomic_load(&g_pw_block)) return 0;
+    if (seen) { size_t s = __atomic_load_n(&g_pw_seen, __ATOMIC_RELAXED); *seen = s < g_pw_n ? s : g_pw_n; }
+    if (total) *total = g_pw_n;
+    return 1;
+}
 static void *prewarm_thread(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk prewarm");
-    setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores
+    int blocking = arg != NULL; pthread_setname_np(pthread_self(), "vk prewarm");
+    if (!blocking) setpriority(PRIO_PROCESS, 0, 10);   // below the game's threads: prewarm uses idle cores (at launch the game waits for it: every core)
     for (;;) {
         size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
+        __atomic_add_fetch(&g_pw_seen, 1, __ATOMIC_RELAXED);
         const pkey *k = &g_pw[i];
         pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
         if (have) continue;
@@ -931,8 +939,10 @@ static void *prewarm_thread(void *arg) {
         size_t d = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_RELAXED);
         if (d == g_pw_n || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_n);
     }
+    atomic_fetch_sub(&g_pw_live, 1);
     return NULL;
 }
+void vk_present_progress(void);   // gfx_vk_present.c: the screen redrawn (the present thread started when there is a window)
 static void prewarm_start(void) {
     const char *root = getenv("DM_ROOT"); if (!root) return;
     char path[1024]; snprintf(path, sizeof path, "%s/vk_pipelines.bin", root);
@@ -943,12 +953,34 @@ static void prewarm_start(void) {
         if (n > 0) { g_pw = malloc((size_t)n * sizeof(pkey)); g_pw_n = fread(g_pw, sizeof(pkey), (size_t)n, f); }
     }
     if (f) fclose(f);
+    g_pw_own = g_pw_n;
+    // The seed (porter: vk_pipelines.seed.bin in the data pack, the list an earlier install of the game recorded on a device): its pipelines are built as the own
+    // ones are, so a first launch, a new install or another driver starts warm. Not written into the own list (each launch would add it again); a pipeline in both
+    // is built once (the thread finds it made). The pipelines are the game's states, not a driver's output: any driver builds them
+    { char sp[1024]; snprintf(sp, sizeof sp, "%s/vk_pipelines.seed.bin", root); FILE *s = fopen(sp, "rb"); uint32_t sh[2] = {0};
+      if (s && fread(sh, sizeof sh, 1, s) == 1) {
+          if (sh[0] != hdr[0] || sh[1] != hdr[1]) VKLOG("prewarm: the seed list is from another host build (record size %u, this one %u): not used", sh[1], hdr[1]);
+          else { fseek(s, 0, SEEK_END); long m = (ftell(s) - (long)sizeof sh) / (long)sizeof(pkey); fseek(s, sizeof sh, SEEK_SET);
+                 pkey *g = m > 0 ? realloc(g_pw, (g_pw_n + (size_t)m) * sizeof(pkey)) : NULL;
+                 if (g) { g_pw = g; size_t got = fread(g_pw + g_pw_n, sizeof(pkey), (size_t)m, s); g_pw_n += got; VKLOG("prewarm: %zu pipelines from the seed list", got); } }
+      }
+      if (s) fclose(s); }
     // rewrite the file with the records read (dropping a torn last record), then append to it
-    g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_n) fwrite(g_pw, sizeof(pkey), g_pw_n, g_prec); fflush(g_prec); }
-    if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
-    long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
-    VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
-    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, NULL); pthread_attr_destroy(&a); }
+    g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_own) fwrite(g_pw, sizeof(pkey), g_pw_own, g_prec); fflush(g_prec); }
+    // DM_VK_PREWARM (the pause menu's Shader prewarm, front_android.c): 0 off, 1 in the background while the game runs (the default), 2 at launch, the game held
+    // until every pipeline is built, on every core but one, its progress on the screen (a PC game's shader compilation): nothing seen before stalls a frame
+    const char *pm = getenv("DM_VK_PREWARM"); int mode = pm && *pm ? atoi(pm) : 1; if (getenv("DM_VK_NOPREWARM")) mode = 0;
+    if (!g_pw_n || !mode) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off" : ""); return; }
+    long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = mode == 2 ? (int)(nc > 8 ? 7 : nc > 1 ? nc - 1 : 1) : nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
+    VKLOG("prewarm: %zu pipelines (%zu recorded here) on %d threads, %s", g_pw_n, g_pw_own, nt, mode == 2 ? "at launch: the game waits" : "in the background");
+    atomic_store(&g_pw_live, nt); if (mode == 2) atomic_store(&g_pw_block, 1);
+    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, mode == 2 ? (void *)1 : NULL); pthread_attr_destroy(&a); }
+    if (mode != 2) return;
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (atomic_load(&g_pw_live) > 0) { vk_present_progress(); struct timespec ts = {0, 100000000}; nanosleep(&ts, NULL); }
+    atomic_store(&g_pw_block, 0); vk_present_progress();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    VKLOG("prewarm: at launch, %zu pipelines built in %.1f s", (size_t)g_pw_done, (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9);
 }
 // ---- what each thread is building, for the crash dump. Issue #64: Super Mario Bros. Wonder crashed in the Adreno 750's shader compiler (libllvm-qgl.so, driver 512.762)
 // at its title scene, with no log line to say which pipeline or which thread; and a pipeline that crashes is never recorded for the prewarm, so every run met it again.

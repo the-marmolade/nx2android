@@ -107,14 +107,18 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_DRIVER, OVM_DRUN, OVM_DQUIT, OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_DRIVER, OVM_DRUN, OVM_DQUIT, OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c)
 #define OVM_TABS 4   // the open tab in dm_menu_state: bit 8 its low bit, bit 19 its high one
 #define OVM_PER_TAB 4
 // Driver: the Vulkan driver for the next launch (the APK's DM_VK_DRIVERS and the system's), the one this launch runs on, and Quit, which the choice needs: a driver
 // is loaded once, before the game's first frame (gfx_vk_core.c vk_init). dm_menu_state bits 29..30: the chosen driver
 static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT},
-                                                         {OVM_DRIVER, OVM_DRUN, OVM_DQUIT, -1}, {OVM_FCAP, OVM_C120, OVM_LOWLAT, -1}};
+                                                         {OVM_DRIVER, OVM_DRUN, OVM_DQUIT, -1}, {OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM}};
+// Shader prewarm (DM_VK_PREWARM, for the next launch): At launch, Background, Off. Its value is not in dm_menu_state: bit 23 turns over at each change, and the
+// panel, redrawn, asks for it (front_android.c dm_prewarm_mode)
+static const char *const OVM_PREWARMS[3] = {"Off", "Background", "At launch"};
+int dm_prewarm_mode(void);
 // Display: Frame rate (Auto: the adaptive governor; or held at 60, 40, 30: perf_android.c dm_perf_set_cap) and the 120 Hz container (the display asked for
 // DM_DISPLAY_HZ whatever the game's rate; its frames paced on that grid, 2, 3 or 4 vsyncs each: dm_perf_set_container). dm_menu_state bits 25..26: the frame rate
 // (OVM_FCAPS' index), bit 27: the container; bit 24: the export count's low bit (a change of it redraws the panel). Low latency (perf_android.c dm_perf_set_lowlat):

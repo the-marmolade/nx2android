@@ -791,6 +791,9 @@ class Port:
         if self.o.shared_font:   # the host serves it for every shared-font type but the button icons (hle_sdk16.c font_get)
             font_env, font_files = font_env + [f'DM_SHARED_FONT={datapack.files_folder(self.package)}/standard.ttf'], {**font_files, 'standard.ttf': self.o.shared_font}
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
+        # the shader list an earlier install recorded on a device (install.harvest_pipelines), beside the pack or in the game folder: the pack's seed list
+        seed = next((p for p in (self.o.out / install.PIPELINES, self.o.folder / install.PIPELINES) if p.is_file() and p.stat().st_size > 8), None)
+        if seed: font_files = {**font_files, 'vk_pipelines.seed.bin': seed}; say(f'shader list: {seed} packed as the seed list ({seed.stat().st_size // 1024} KB)')
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
                              + ([f'DM_VK_DRIVER={self.drivers[0][2]}', 'DM_VK_DRIVERS=' + ';'.join(f'{n}={lib}' for n, _, lib in self.drivers)] if self.drivers else [])
