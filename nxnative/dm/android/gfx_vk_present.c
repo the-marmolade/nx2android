@@ -377,7 +377,7 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
-                                              "Next launch", "Running", "Save first, then", "Resume", ""};
+                                              "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static void ov_menu_panel(const ov_canvas *cv, int st) {
@@ -420,6 +420,10 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             snprintf(v, sizeof v, "%s", x == OVX_BUSY ? "Exporting..." : x == OVX_DONE ? nm : x == OVX_NOSAVE ? "No save yet" : "Failed");
             while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
             cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, x == OVX_FAILED ? C_ACCENT : C_WHITE);
+        } else if (it == OVM_FCAP) {   // the frame rate: Auto or the held rate
+            int c = OVM_FCAPS[st >> 25 & 3], vs = is; char v[24]; if (c) snprintf(v, sizeof v, "< %d fps >", c); else snprintf(v, sizeof v, "< Auto >");
+            while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
+            cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, c ? C_ACCENT : C_WHITE);
         } else if (it == OVM_DRIVER || it == OVM_DRUN) {   // the chosen driver (accent: not the running one, Quit applies it), the running one
             char chosen[32], running[48]; int differs = dm_driver_names(chosen, sizeof chosen, running, sizeof running), vs = is;
             char v[40]; if (it == OVM_DRIVER) snprintf(v, sizeof v, "< %s >", chosen); else snprintf(v, sizeof v, "%s", running);
@@ -433,7 +437,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_rrect(cv, x0 + docked * segw, cy - hh / 2, x0 + (docked + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
             for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(OVM_MODES[k], is)) / 2, cy, OVM_MODES[k], is, k == docked ? C_WHITE : C_DIM);
         } else {   // a switch
-            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : 3) & 1; float sx0 = x1 - sw;
+            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
             cv_disc(cv, on ? x1 - sh / 2 : sx0 + sh / 2, cy, sh / 2 - fmaxf(2, sh * 0.1f), on ? C_WHITE : C_KNOB_OFF);
             const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : "ON"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
@@ -1047,7 +1051,7 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
     pthread_mutex_unlock(&g_pq_mu);
     return n;
 }
-void dm_perf_frame(double period); void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns);   // perf_android.c
+void dm_perf_frame(double period); void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns); int dm_perf_container(void);   // perf_android.c
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vk_init();
     { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void);   // what else the frame costs: its replay and its GPU time
@@ -1057,9 +1061,10 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     // A longer period goes to the window only once it has held for 60 presents; a shorter one at once. Super Mario Bros. Wonder's own controller (main+0xcfd24) asks
     // for interval 2 for a frame or a few and then 1 again: each ask was a vote (176 in 3 minutes of its first level on the Y700, 27-60 a run in issue #64's log of an
     // Adreno 750 phone with a 60 Hz display), and where the display changes its mode for a vote, the switch itself lengthens the next frames (issue #45: 30-40 fps)
-    static ANativeWindow *rate_win; static double rate_period, want_period; static uint64_t want_since;
+    static ANativeWindow *rate_win; static double rate_period, want_period; static uint64_t want_since; static int rate_cont = -1; int cont = dm_perf_container();
     if (period != want_period) { want_period = period; want_since = g_presents; }
-    if (g_win && (g_win != rate_win || (period != rate_period && (period < rate_period || g_presents - want_since >= 60)))) { rate_win = g_win; rate_period = period; dm_perf_window(g_win, period > 0 ? 1.0 / period : 60); }
+    if (g_win && (g_win != rate_win || cont != rate_cont || (!cont && period != rate_period && (period < rate_period || g_presents - want_since >= 60)))) {   // (the container: one rate)
+        rate_win = g_win; rate_period = period; rate_cont = cont; dm_perf_window(g_win, period > 0 ? 1.0 / period : 60); }
     uint64_t n = ++g_presents;
     // without display times (no VK_GOOGLE_display_timing, no window, or none came back) the hand-over time stands in, as before: the governor's late check needs readings
     { int disp = V.has_dtiming && dm_front_window() && (n <= 240 || g_pres_recorded); struct timespec ts; if (!disp) clock_gettime(CLOCK_MONOTONIC, &ts);

@@ -77,6 +77,8 @@ static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 #define DRV_MAX 3
 static char g_drv_name[DRV_MAX + 1][24] = {"System"}, g_drv_lib[DRV_MAX + 1][96]; static int g_drv_n, g_drv_run;
 static _Atomic int g_set_driver = -1;
+static _Atomic int g_set_fcap, g_set_cont;   // the Display tab: Frame rate (OVM_FCAPS' index, 0 Auto), the 120 Hz container
+void dm_perf_set_cap(int fps); void dm_perf_set_container(int on);   // perf_android.c
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
 static _Atomic int g_cust[2][2][DM_AOV_N][3], g_cust_ver, g_edit;
@@ -91,6 +93,8 @@ static void settings_load(void) {
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
+        else if (sscanf(line, "fpscap=%d", &v) == 1) { int k = 0; for (int i = 1; i < 4; i++) if (OVM_FCAPS[i] == v) k = i; atomic_store(&g_set_fcap, k); }   // 60, 40, 30; else Auto
+        else if (sscanf(line, "container=%d", &v) == 1) atomic_store(&g_set_cont, v != 0);
         else if (sscanf(line, "driver=%d", &v) == 1) atomic_store(&g_set_driver, v < 0 ? -1 : v);   // (checked against the list in drivers_init)
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, l, i;
@@ -110,6 +114,7 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
     if (atomic_load(&g_set_driver) >= 0) fprintf(f, "driver=%d\n", atomic_load(&g_set_driver));
+    fprintf(f, "fpscap=%d\ncontainer=%d\n", OVM_FCAPS[atomic_load(&g_set_fcap) & 3], atomic_load(&g_set_cont));
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
         if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);
@@ -386,7 +391,7 @@ int dm_menu_state(void) {
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | (atomic_load(&g_set_fps) != 0) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 19 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 |
+           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 19 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 1) << 24 | (atomic_load(&g_set_fcap) & 3) << 25 | (atomic_load(&g_set_cont) != 0) << 27 |
            (atomic_load(&g_set_fps) == 2) << 28 | ((atomic_load(&g_set_driver) < 0 ? g_drv_run : atomic_load(&g_set_driver)) & 3) << 29;   // Show FPS at ALL: the counter, the frame-time graph and the GPU's load
 }
 int dm_overlay_fps(void) { return atomic_load(&g_menu) ? 0 : atomic_load(&g_set_fps); }   // gfx_vk_present.c draws it (not while the menu holds the game): 0 none, 1 the counter, 2 the HUD
@@ -441,6 +446,7 @@ int dm_driver_names(char *sel, int scap, char *run, int rcap) {
     else snprintf(run, (size_t)rcap, "%s", g_drv_name[g_drv_run]);
     return d != g_drv_run;
 }
+static void fcap_step(int by) { int k = ((atomic_load(&g_set_fcap) + by) % 4 + 4) % 4; atomic_store(&g_set_fcap, k); dm_perf_set_cap(OVM_FCAPS[k]); settings_save(); }
 static void driver_step(int by) { int n = g_drv_n + 1, d = atomic_load(&g_set_driver); if (d < 0) d = g_drv_run; atomic_store(&g_set_driver, ((d + by) % n + n) % n); settings_save(); }
 // Quit for the chosen driver: Activity.finishAndRemoveTask (on_destroy ends the process); reopened, the app loads it. Relaunching by itself would need an activity in a
 // process of its own: one that ends its own process while in front is taken off the screen, not started again
@@ -466,6 +472,8 @@ static void menu_do(int item) {
     else if (item == OVM_EXPORT) { if (atomic_load(&g_sv_st) == OVX_BUSY) return; save_export(); }
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
     else if (item == OVM_DRIVER) driver_step(1);
+    else if (item == OVM_FCAP) fcap_step(1);
+    else if (item == OVM_C120) { int on = !atomic_load(&g_set_cont); atomic_store(&g_set_cont, on); dm_perf_set_container(on); settings_save(); }
     else if (item == OVM_DRUN) return;   // (a note: the driver this launch runs on)
     else if (item == OVM_DQUIT) { dm_haptics_android_tap(); driver_quit(); return; }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
@@ -508,6 +516,7 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
         atomic_store(&g_menu_hi, hi); dm_overlay_redraw();
     } else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_OPACITY) { menu_opacity(atomic_load(&g_set_opacity) + (bit == DM_BTN_LEFT ? -5 : 5)); settings_save(); }
     else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_TAB) menu_tab(tab + (bit == DM_BTN_LEFT ? -1 : 1));
+    else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_FCAP) { fcap_step(bit == DM_BTN_LEFT ? -1 : 1); dm_haptics_android_tap(); dm_overlay_redraw(); }
     else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_DRIVER) { driver_step(bit == DM_BTN_LEFT ? -1 : 1); dm_haptics_android_tap(); dm_overlay_redraw(); }
     else if (bit == DM_BTN_L || bit == DM_BTN_ZL || bit == DM_BTN_R || bit == DM_BTN_ZR) {
         menu_tab(tab + (bit == DM_BTN_L || bit == DM_BTN_ZL ? -1 : 1));
@@ -1160,7 +1169,8 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
-    settings_load(); drivers_init(); dm_haptics_android_start(act, atomic_load(&g_set_rumble));
+    settings_load(); drivers_init(); dm_perf_set_cap(OVM_FCAPS[atomic_load(&g_set_fcap) & 3]); dm_perf_set_container(atomic_load(&g_set_cont));
+    dm_haptics_android_start(act, atomic_load(&g_set_rumble));
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);

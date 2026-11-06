@@ -6,6 +6,7 @@
 #include <android/native_window.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -154,7 +155,21 @@ static int64_t work_pct(int q) {   // the q-th percentile of the last 64 frames'
     return v[(n * q) / 100];
 }
 static int64_t work_p95(void) { return work_pct(95); }
+// The pause menu's Frame rate (front_android.c): held at 60, 40 or 30 (a STEPS index), or -1 Auto, the governor's. Held, it applies with the governor off too
+// (DM_ADAPTIVE_FPS=0), and as the governor's steps never faster than the game asks
+static _Atomic int g_menu_pin = -1;
+void dm_perf_set_cap(int fps) {
+    int st = fps == 60 ? 0 : fps == 40 ? 1 : fps == 30 ? 2 : -1;
+    if (atomic_exchange(&g_menu_pin, st) != st) LOG("[perf] frame rate %s (pause menu)", st < 0 ? "Auto" : fps == 60 ? "held at 60" : fps == 40 ? "held at 40" : "held at 30");
+}
+// The 120 Hz container (the pause menu): the window asks the display for DM_DISPLAY_HZ (120 by default) whatever the game's rate, rather than a rate the game's divides
+// (dm_perf_window), which let Android drop a 120 Hz panel to 60. The frames keep the game's period, paced on the display's vsync grid (gfx_vk_present.c pace_desired):
+// 60 fps two vsyncs a frame, 40 three, 30 four; no display mode change when the rate steps, and a 40 fps step that 60 Hz cannot pace evenly
+static _Atomic int g_container;
+void dm_perf_set_container(int on) { if (atomic_exchange(&g_container, on != 0) != (on != 0)) LOG("[perf] 120 Hz container %s (pause menu)", on ? "on" : "off"); }
+int dm_perf_container(void) { return atomic_load(&g_container); }
 uint64_t dm_present_period_adapt(uint64_t period) {
+    { int mp = atomic_load(&g_menu_pin); if (mp >= 0 && period) { g_game_period = period; return (uint64_t)STEPS[mp] > period ? (uint64_t)STEPS[mp] : period; } }
     if (g_adapt < 0) { const char *e = getenv("DM_ADAPTIVE_FPS"); g_adapt = !(e && !atoi(e)); }
     if (!g_adapt || !period) return period;
     g_game_period = period;
@@ -162,6 +177,7 @@ uint64_t dm_present_period_adapt(uint64_t period) {
     return (uint64_t)want > period ? (uint64_t)want : period;   // never faster than the game asks
 }
 static int fps_pin(void) {   // a DM_CTL "env DM_FPS_PIN=40" line holds that step (60, 40 or 30; anything else lets the rate adapt again): tests
+    int mp = atomic_load(&g_menu_pin); if (mp >= 0) return mp;   // the pause menu's Frame rate first
     static unsigned k; static int pin = -1; if (k++ % 30) return pin;
     const char *e = getenv("DM_FPS_PIN"); int v = e ? atoi(e) : 0, st = v == 60 ? 0 : v == 40 ? 1 : v == 30 ? 2 : -1;
     if (st != pin) { pin = st; LOG("[perf] adaptive frame rate %s", st < 0 ? "free again" : "pinned"); }
@@ -278,6 +294,7 @@ void dm_perf_frame(double period) {
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).
 void dm_perf_window(ANativeWindow *w, double fps) {
     if (!w || fps <= 0) return;
+    if (atomic_load(&g_container)) { const char *e = getenv("DM_DISPLAY_HZ"); double hz = e && atof(e) > 0 ? atof(e) : 120; fps = hz; }   // the container's rate
     int r = ANativeWindow_setFrameRate(w, (float)fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
     LOG("[perf] window frame rate %.0f fps%s", fps, r ? " refused" : "");
 }
