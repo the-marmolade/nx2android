@@ -623,6 +623,29 @@ static void ov_frame(VkCommandBuffer cb, int sp, const float b[4], float t, floa
 static float g_ft[OV_FT_N]; static int g_ft_i, g_ft_n;   // frame times, ms (a ring)
 static void ov_ft_push(float ms) { g_ft[g_ft_i] = ms; g_ft_i = (g_ft_i + 1) % OV_FT_N; if (g_ft_n < OV_FT_N) g_ft_n++; }
 static int kgsl_read(const char *path, long *v) { FILE *f = fopen(path, "r"); if (!f) return 0; int ok = fscanf(f, "%ld", v) == 1; fclose(f); return ok; }
+// KGSL's files are read on a thread of their own, twice a second while the HUD shows: a sysfs read can take milliseconds (the kernel samples the GPU), and made on the
+// present thread it held a frame's hand-over (one or two amber bars a second in a green graph). The thread idles when the HUD has not asked for a second, and ends for
+// good when the busy percentage cannot be read (the timestamps stand in)
+static _Atomic long g_kgsl_busy = -1, g_kgsl_mhz = -1; static _Atomic int64_t g_kgsl_want;   // the latest readings (-1 none); when the HUD last asked (perf clock)
+static void *kgsl_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "dm hud gpu"); int first = 1;
+    for (;;) {
+        struct timespec ts = {0, 500000000}, now; clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((int64_t)now.tv_sec * 1000000000 + now.tv_nsec - atomic_load(&g_kgsl_want) < 1000000000ll) {
+            long b = -1, hz = -1;
+            int ok = kgsl_read("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", &b);
+            if (!kgsl_read("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", &hz)) kgsl_read("/sys/class/kgsl/kgsl-3d0/gpuclk", &hz);
+            if (first) { first = 0; VKLOG("[perf] HUD: GPU load from %s", ok ? "KGSL (busy percentage and clock, read on its own thread)" : "the GPU's timestamps (KGSL's busy percentage refused or absent)"); }
+            if (!ok) { atomic_store(&g_kgsl_busy, -1); atomic_store(&g_kgsl_mhz, -1); return NULL; }
+            atomic_store(&g_kgsl_busy, b); atomic_store(&g_kgsl_mhz, hz > 0 ? hz / 1000000 : -1);
+        }
+        nanosleep(&ts, NULL);
+    }
+}
+static void kgsl_start(void) { pthread_t t; if (!pthread_create(&t, NULL, kgsl_thread, NULL)) pthread_detach(t); }
+static void kgsl_ask(int64_t now) {   // the HUD shows: readings wanted (the thread started at the first ask); now: CLOCK_MONOTONIC ns, as the thread's
+    static pthread_once_t once = PTHREAD_ONCE_INIT; atomic_store(&g_kgsl_want, now); pthread_once(&once, kgsl_start);
+}
 static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, const char *s) {   // a line of the counter's characters, its left edge at x
     float gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
     for (int i = 0; s[i]; i++, x += cw) {
@@ -633,20 +656,14 @@ static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, co
 extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all submissions
 static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     static uint64_t n0, nl; static int64_t t0, tl; static int fps = -1;
-    static int kgsl = -1; static long busy = -1, mhz = -1; static uint64_t g0; static float gms = -1, gpct = -1;   // kgsl: 1 readable, 0 refused, -1 not tried
+    static uint64_t g0; static float gms = -1, gpct = -1;
+    long busy = -1, mhz = -1; if (level > 1) { kgsl_ask(now); busy = atomic_load(&g_kgsl_busy); mhz = atomic_load(&g_kgsl_mhz); }   // (kgsl_thread's latest)
     uint64_t n = atomic_load(&g_fps_frames);
     if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; g0 = g_gpu_ns; gms = gpct = -1; g_ft_n = 0; }   // the first frame, or after a pause in the presents: measure anew
     else if (now - t0 >= 500000000ll) {
         double dt = (double)(now - t0); uint64_t g = g_gpu_ns;
         fps = (int)((double)(n - n0) * 1e9 / dt + 0.5);
         if (n > n0 && g >= g0) { gms = (float)((double)(g - g0) / (double)(n - n0) / 1e6); gpct = (float)((double)(g - g0) * 100 / dt); }
-        if (level > 1 && kgsl != 0) {
-            long b = -1, hz = -1;
-            int ok = kgsl_read("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", &b);
-            if (!kgsl_read("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", &hz)) kgsl_read("/sys/class/kgsl/kgsl-3d0/gpuclk", &hz);
-            if (kgsl < 0) VKLOG("[perf] HUD: GPU load from %s", ok ? "KGSL (busy percentage and clock)" : "the GPU's timestamps (KGSL's busy percentage refused or absent)");
-            kgsl = ok; busy = ok ? b : -1; mhz = hz > 0 ? hz / 1000000 : -1;
-        }
         t0 = now; n0 = n; g0 = g;
     }
     if (level > 1 && n != nl) {   // a frame (or a few) shown since the last present: each one's share of the time since
