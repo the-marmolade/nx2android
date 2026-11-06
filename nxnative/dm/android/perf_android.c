@@ -274,25 +274,38 @@ static int64_t g_prev_present, g_pace, g_pq;
 void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
 // Low latency (the pause menu's Display tab; RTSS's front-edge sync, NVIDIA's low-latency mode): the frame starts just in time for its slot (hle_nvn.c acquire),
-// its lead the 95th percentile of the last 32 frames' work and a margin. The margin starts at 2 ms, grows 1 ms for each frame that misses its slot (to 8 ms) and
+// its lead the 95th percentile of the last 32 frames' cost and a margin. A frame's cost is its work and the replay's or the GPU's time after it (the larger,
+// dm_perf_frame_cost): the work alone let Super Mario Odyssey on the AYN Thor (Standard mode, 1.8 GHz, GPU 401 MHz; 9 ms of work, 14 ms of GPU) start frames
+// that could not reach their slot, 25 ms frames at 120 Hz, a third of them. A lead over the period starts the frame before the last slot: the next frame's work
+// beside this one's GPU time, as the stock acquire allows, but no sooner than the frame needs (a pipeline simulation of the Thor's recordings: 0.9-1.8% of frames
+// late against the first version's 7-17%, and 7-12 ms of the stock 34-40 ms saved). Over two periods low latency stands aside (0) until it is back under 90% of them. The margin starts at 2 ms, grows 1 ms for each frame that misses its slot (to 8 ms) and
 // comes back 0.5 ms after each 600 frames with none; the frames waiting ready in the queues are what it saves, the cost a frame that runs long misses its slot
 #define LL_N 32
 static _Atomic int g_lowlat; static _Atomic int64_t g_ll_lead, g_ll_margin = 2000000; static int64_t g_ll_work[LL_N]; static int g_ll_i, g_ll_n; static unsigned g_ll_ok;
 void dm_perf_set_lowlat(int on) { if (atomic_exchange(&g_lowlat, on != 0) != (on != 0)) { g_ll_n = 0; atomic_store(&g_ll_lead, 0); LOG("[perf] low latency %s (pause menu)", on ? "on" : "off"); } }
-int64_t dm_perf_lowlat_lead(void) { return atomic_load(&g_lowlat) ? atomic_load(&g_ll_lead) : 0; }   // 0: off, or not measured yet
+static _Atomic int g_ll_aside;
+int64_t dm_perf_lowlat_lead(uint64_t period) {   // 0: off, not measured yet, or standing aside (a lead over two periods)
+    if (!atomic_load(&g_lowlat)) return 0;
+    int64_t lead = atomic_load(&g_ll_lead); if (!lead || !period) return 0;
+    int aside = atomic_load(&g_ll_aside), want = aside ? lead * 10 > (int64_t)(2 * period) * 9 : lead > (int64_t)(2 * period);
+    if (want != aside && atomic_exchange(&g_ll_aside, want) != want)
+        LOG("[perf] low latency %s: a frame needs %.1f ms before its slot, the period is %.1f ms", want ? "stands aside" : "back", lead / 1e6, period / 1e6);
+    return want ? 0 : lead;
+}
 void dm_perf_lowlat_late(void) {
     int64_t m = atomic_load(&g_ll_margin); g_ll_ok = 0;
     if (m < 8000000) { atomic_store(&g_ll_margin, m + 1000000); LOG("[perf] low latency: a frame missed its slot, margin %.1f ms", (m + 1000000) / 1e6); }
 }
-static void ll_record(int64_t w) {
+static void ll_record(int64_t w) {   // w: the frame's work; its replay's or GPU's time added here
     if (!atomic_load(&g_lowlat)) return;
+    w += g_frame_cost > 0 && g_frame_cost < 250000000 ? g_frame_cost : 0;
     g_ll_work[g_ll_i++ % LL_N] = w; if (g_ll_n < LL_N) g_ll_n++;
     if (++g_ll_ok >= 600) { int64_t m = atomic_load(&g_ll_margin); if (m > 2000000) atomic_store(&g_ll_margin, m - 500000); g_ll_ok = 0; }
     if (g_ll_n < 16) return;
     int64_t v[LL_N]; int n = g_ll_n; memcpy(v, g_ll_work, sizeof(int64_t) * (size_t)n);
     for (int i = 1; i < n; i++) { int64_t x = v[i]; int j = i - 1; while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; } v[j + 1] = x; }
     atomic_store(&g_ll_lead, v[(n * 95) / 100] + atomic_load(&g_ll_margin));
-    { static unsigned k; if (++k % 600 == 0) LOG("[perf] low latency: lead %.1f ms (work p95 %.1f + margin %.1f)", atomic_load(&g_ll_lead) / 1e6, v[(n * 95) / 100] / 1e6, atomic_load(&g_ll_margin) / 1e6); }
+    { static unsigned k; if (++k % 600 == 0) LOG("[perf] low latency: lead %.1f ms (frame cost p95 %.1f + margin %.1f)", atomic_load(&g_ll_lead) / 1e6, v[(n * 95) / 100] / 1e6, atomic_load(&g_ll_margin) / 1e6); }
 }
 // ---- the device's readings (perf_sample.h): the HUD's lines and the recording's columns, on their threads (sysfs, Java) ----
 static long rd_long(const char *p) { FILE *f = fopen(p, "r"); long v = -1; if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); } return v; }

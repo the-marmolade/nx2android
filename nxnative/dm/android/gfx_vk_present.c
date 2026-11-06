@@ -661,6 +661,7 @@ static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, co
     }
 }
 extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all submissions
+int dm_perf_container(void);   // perf_android.c: the 120 Hz container (the HUD's green limit)
 static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     static uint64_t n0, nl; static int64_t t0, tl; static int fps = -1;
     static uint64_t g0; static float gms = -1, gpct = -1;
@@ -696,10 +697,14 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + 5 * lh + 3 * pad + gh, 0.5f);
     ov_line(cb, x, m + pad, cw, ch, s); ov_line(cb, x, m + pad + lh, cw, ch, l2); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3);
     ov_line(cb, x, m + pad + 3 * lh, cw, ch, l4); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l5);
+    // green up to: 5% over the period; with the 120 Hz container half a refresh over it (a frame handed over a little late still makes its refresh, and one that
+    // misses shows a whole refresh longer: 25 ms for 60 fps at 120 Hz, amber)
+    float ok_ms = period * 1.05f;
+    if (dm_perf_container()) { const char *e = getenv("DM_DISPLAY_HZ"); float hz = e && atof(e) > 0 ? (float)atof(e) : 120; ok_ms = period + 500.0f / hz; }
     float gx = x, gy = m + 5 * lh + 2 * pad, top = period * 2.5f, bwid = (gw - ch * 0.5f) / OV_FT_N;   // the graph: 2.5 periods tall, new frames on the right
     for (int i = 0; i < g_ft_n; i++) {
         float ms = g_ft[(g_ft_i + OV_FT_N - g_ft_n + i) % OV_FT_N], hgt = (ms > top ? top : ms) / top * gh, bx = gx + (OV_FT_N - g_ft_n + i) * bwid;
-        ov_block(cb, ms <= period * 1.05f ? SP_GREEN : ms <= period * 1.5f ? SP_AMBER : SP_RED, bx, gy + gh - hgt, bx + bwid * 0.8f + 0.5f, gy + gh, 0.9f);
+        ov_block(cb, ms <= ok_ms ? SP_GREEN : ms <= period * 1.5f ? SP_AMBER : SP_RED, bx, gy + gh - hgt, bx + bwid * 0.8f + 0.5f, gy + gh, 0.9f);
     }
     float py = gy + gh - period / top * gh; ov_block(cb, SP_WHITE, gx, py - 0.75f, gx + gw - ch * 0.5f, py + 0.75f, 0.5f);   // the frame period's line
 }

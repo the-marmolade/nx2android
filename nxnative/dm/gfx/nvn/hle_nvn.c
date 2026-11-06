@@ -1422,7 +1422,7 @@ __attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns)
 // Low latency (Android's pause menu, perf_android.c): the lead a frame needs before its slot (its recent work and a margin; 0 = off), and a frame that missed its slot.
 // The acquire otherwise lets the game start a frame as soon as its texture's last slot is a period past: with 3 textures about two periods before the frame's own
 // slot, and the frames ready early wait in the queues for their turn on screen, each a period more between the input the game read and the picture
-__attribute__((weak)) int64_t dm_perf_lowlat_lead(void) { return 0; }
+__attribute__((weak)) int64_t dm_perf_lowlat_lead(uint64_t period) { (void)period; return 0; }
 __attribute__((weak)) void dm_perf_lowlat_late(void) {}
 static uint64_t g_ll_slot;   // the last present's slot (nvn_pace), from which the next frame's slot is a period on   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
 __attribute__((weak)) uint64_t dm_present_period_adapt(uint64_t period) { return period; }   // Android (perf_android.c): a longer period the frames can hold steadily
@@ -1448,8 +1448,8 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         uint64_t p0 = now_ns();
         if (mtl_link_active()) { if (!mtl_link_wait_tick(present_itv(o), period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK: pacing fully follows the display link (wait for the present interval's display-link ticks when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else {
-            int64_t lead = dm_perf_lowlat_lead();   // Low latency: start no sooner than the next slot less the lead the frame needs
-            if (lead > 0 && g_ll_slot && period) { uint64_t ll = g_ll_slot + period - ((uint64_t)lead < period ? (uint64_t)lead : period); if (ll > at) { at = ll; wait = at > now ? at - now : 0; } }
+            int64_t lead = dm_perf_lowlat_lead(period);   // Low latency: start no sooner than the next slot less the lead the frame needs (0: off, or standing aside)
+            if (lead > 0 && g_ll_slot && period && g_ll_slot + period > (uint64_t)lead) { uint64_t ll = g_ll_slot + period - (uint64_t)lead; if (ll > at) { at = ll; wait = at > now ? at - now : 0; } }   // (a lead over the period: started before the last slot, the overlap kept in part)
             if (wait) sleep_until_ns(at);
         }
         pace_ns = now_ns() - p0;
@@ -1992,7 +1992,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
     g_hold_ring[o->presents % 16] = (uint8_t)present_itv(o);
     nvn_pacer pc = {o->pace};
-    if (period && pc.target && now > pc.target + period && dm_perf_lowlat_lead() > 0) dm_perf_lowlat_late();   // past its slot: low latency's margin grows
+    if (period && pc.target && now > pc.target + period && dm_perf_lowlat_lead(period) > 0) dm_perf_lowlat_late();   // past its slot: low latency's margin grows
     uint64_t slot = now + nvn_pace(&pc, now, period);
     g_ll_slot = period ? slot : 0;
     o->pace = pc.target;
