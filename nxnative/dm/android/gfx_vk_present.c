@@ -377,13 +377,13 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
-                                              "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Resume", ""};
+                                              "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static void ov_menu_panel(const ov_canvas *cv, int st) {
     float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
     float rh = r[3], rw = r[2], gap = rh * 0.35f, sh = rh * 0.40f, sw = sh * 1.85f;
-    int tab = (st >> 8 & 1) | (st >> 19 & 1) << 1, sel = (st >> 4 & 15) - 1, op = st >> 9 & 127;
+    int tab = (st >> 8 & 1) | (st >> 19 & 1) << 1, sel = (st >> 4 & 7) - 1, op = st >> 9 & 127;
     int is = (int)fmaxf(1, roundf(rh * 0.30f / 7));
     for (; is > 1; is--) {   // the widest row: its label, a gap and its control
         float need = 0;
@@ -437,7 +437,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_rrect(cv, x0 + docked * segw, cy - hh / 2, x0 + (docked + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
             for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(OVM_MODES[k], is)) / 2, cy, OVM_MODES[k], is, k == docked ? C_WHITE : C_DIM);
         } else {   // a switch
-            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : 3) & 1; float sx0 = x1 - sw;
+            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : it == OVM_LOWLAT ? 7 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
             cv_disc(cv, on ? x1 - sh / 2 : sx0 + sh / 2, cy, sh / 2 - fmaxf(2, sh * 0.1f), on ? C_WHITE : C_KNOB_OFF);
             const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : "ON"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);

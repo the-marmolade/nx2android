@@ -272,6 +272,27 @@ static void adapt_frame(int64_t work, int64_t now) {
 static int64_t g_prev_present, g_pace, g_pq;
 void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
+// Low latency (the pause menu's Display tab; RTSS's front-edge sync, NVIDIA's low-latency mode): the frame starts just in time for its slot (hle_nvn.c acquire),
+// its lead the 95th percentile of the last 32 frames' work and a margin. The margin starts at 2 ms, grows 1 ms for each frame that misses its slot (to 8 ms) and
+// comes back 0.5 ms after each 600 frames with none; the frames waiting ready in the queues are what it saves, the cost a frame that runs long misses its slot
+#define LL_N 32
+static _Atomic int g_lowlat; static _Atomic int64_t g_ll_lead, g_ll_margin = 2000000; static int64_t g_ll_work[LL_N]; static int g_ll_i, g_ll_n; static unsigned g_ll_ok;
+void dm_perf_set_lowlat(int on) { if (atomic_exchange(&g_lowlat, on != 0) != (on != 0)) { g_ll_n = 0; atomic_store(&g_ll_lead, 0); LOG("[perf] low latency %s (pause menu)", on ? "on" : "off"); } }
+int64_t dm_perf_lowlat_lead(void) { return atomic_load(&g_lowlat) ? atomic_load(&g_ll_lead) : 0; }   // 0: off, or not measured yet
+void dm_perf_lowlat_late(void) {
+    int64_t m = atomic_load(&g_ll_margin); g_ll_ok = 0;
+    if (m < 8000000) { atomic_store(&g_ll_margin, m + 1000000); LOG("[perf] low latency: a frame missed its slot, margin %.1f ms", (m + 1000000) / 1e6); }
+}
+static void ll_record(int64_t w) {
+    if (!atomic_load(&g_lowlat)) return;
+    g_ll_work[g_ll_i++ % LL_N] = w; if (g_ll_n < LL_N) g_ll_n++;
+    if (++g_ll_ok >= 600) { int64_t m = atomic_load(&g_ll_margin); if (m > 2000000) atomic_store(&g_ll_margin, m - 500000); g_ll_ok = 0; }
+    if (g_ll_n < 16) return;
+    int64_t v[LL_N]; int n = g_ll_n; memcpy(v, g_ll_work, sizeof(int64_t) * (size_t)n);
+    for (int i = 1; i < n; i++) { int64_t x = v[i]; int j = i - 1; while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; } v[j + 1] = x; }
+    atomic_store(&g_ll_lead, v[(n * 95) / 100] + atomic_load(&g_ll_margin));
+    { static unsigned k; if (++k % 600 == 0) LOG("[perf] low latency: lead %.1f ms (work p95 %.1f + margin %.1f)", atomic_load(&g_ll_lead) / 1e6, v[(n * 95) / 100] / 1e6, atomic_load(&g_ll_margin) / 1e6); }
+}
 void dm_perf_frame(double period) {
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
@@ -282,7 +303,7 @@ void dm_perf_frame(double period) {
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
         int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)
-        if (w > 0 && w < 250000000) { adapt_frame(w - pace > 0 ? w - pace : 0, t); if (g_hint) hint_report(w, pq, pace, t, g_hint_target); }
+        if (w > 0 && w < 250000000) { adapt_frame(w - pace > 0 ? w - pace : 0, t); ll_record(w - pq > 0 ? w - pq : w); if (g_hint) hint_report(w, pq, pace, t, g_hint_target); }
         g_work_start = 0;
     }
     g_prev_present = t;
