@@ -128,6 +128,8 @@ static int drv_has_gpu(PFN_vkGetInstanceProcAddr g) {
     return ok;
 }
 
+static int g_drv_custom;   // vk_init loaded the APK's driver (DM_VK_DRIVER), not the system's: the pause menu's Driver tab shows it (front_android.c dm_driver_names)
+int dm_vk_driver_custom(void) { return g_drv_custom; }
 void vk_init(void) {
     static int done; if (done) return; done = 1;
     // DM_VK_DRIVER=<library>: a Vulkan driver the APK carries (Mesa's Turnip for Adreno; porter --vulkan-driver), loaded through libadrenotools (BSD-2-Clause), which the
@@ -148,7 +150,7 @@ void vk_init(void) {
             VKLOG("[RED] DM_VK_DRIVER %s: adrenotools could not load it from %s; the system's driver instead", drv, dir);
         else if (!(p_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr")) || !drv_has_gpu(p_vkGetInstanceProcAddr)) {
             VKLOG("[RED] DM_VK_DRIVER %s: no Vulkan 1.3 GPU through it; the system's driver instead", drv); lib = NULL; }   // (left loaded: a driver does not always unload cleanly)
-        else VKLOG("Vulkan driver %s through adrenotools, not the system's (%s)", drv, dir);
+        else { VKLOG("Vulkan driver %s through adrenotools, not the system's (%s)", drv, dir); g_drv_custom = 1; }
     }
     if (!lib) {
         if (!(lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL))) die("[vk] libvulkan.so: %s", dlerror());

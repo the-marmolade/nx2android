@@ -257,9 +257,24 @@ class Misc(unittest.TestCase):
                 with self.assertRaisesRegex(pipeline.BuildError, 'shared-font'): pipeline.Port(pipeline.Options(t, shared_font=t / bad)).run()
         finally: shutil.rmtree(t, ignore_errors=True)
 
+    def test_vulkan_driver_menu(self):   # several --vulkan-driver: their menu names and lib names (DM_VK_DRIVERS)
+        specs = pipeline.driver_specs(['C:/d/vulkan.purple.so', 'Apex V2=C:/e/vulkan.purple.so', 'Bad;N=me=/f/libx.so'])
+        self.assertEqual([n for n, _ in specs], ['purple', 'Apex V2', 'BadN'])
+        self.assertEqual(specs[1][1], Path('C:/e/vulkan.purple.so'))   # a drive letter's colon is not a name
+        self.assertEqual(pipeline.driver_specs('C:/d/x=y/libz.so')[0][0], 'z')   # = in a folder name: no name given
+        self.assertEqual([lib for _, _, lib in pipeline.driver_libs(specs)], ['libvulkan.purple.so', 'libvulkan.purple_2.so', 'libx.so'])
+        self.assertEqual(pipeline.driver_specs(None), [])
+        self.assertEqual(pipeline.driver_specs(Path('/d/libvulkan_freedreno.so')), [('freedreno', Path('/d/libvulkan_freedreno.so'))])
+        t = Path(tempfile.mkdtemp(prefix='nx2a_test_game_'))
+        try:   # four drivers: more than the menu takes, refused before any stage
+            for i in range(4): (t / f'lib{i}.so').write_bytes(b'')
+            with self.assertRaises(pipeline.BuildError): pipeline.Port(pipeline.Options(t, vulkan_driver=[str(t / f'lib{i}.so') for i in range(4)])).run()
+        finally: shutil.rmtree(t, ignore_errors=True)
+
     def test_vulkan_driver_option(self):   # --vulkan-driver FILE: parsed, and a file that is not a .so library fails before any stage
         from porter import cli
-        self.assertEqual(cli._parser().parse_args(['port', 'x', '--vulkan-driver', 'libvulkan_freedreno.so']).vulkan_driver, 'libvulkan_freedreno.so')
+        self.assertEqual(cli._parser().parse_args(['port', 'x', '--vulkan-driver', 'libvulkan_freedreno.so']).vulkan_driver, ['libvulkan_freedreno.so'])
+        self.assertEqual(cli._parser().parse_args(['port', 'x', '--vulkan-driver', 'a.so', '--vulkan-driver', 'B=b.so']).vulkan_driver, ['a.so', 'B=b.so'])
         self.assertIsNone(cli._parser().parse_args(['port', 'x']).vulkan_driver)
         # the APK carries it as lib*.so, the only names the package manager extracts; env.txt's DM_VK_DRIVER names that file
         self.assertEqual(pipeline.driver_lib_name(Path('/d/libvulkan_freedreno.so')), 'libvulkan_freedreno.so')

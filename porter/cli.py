@@ -35,10 +35,11 @@ def _parser():
     po.add_argument('--mt-replay', action='store_true',
                     help='multithread replay: the game\'s Vulkan commands are recorded on a thread of their own (DM_VK_MT_REPLAY=1 in env.txt), for a game whose replay '
                          'thread holds its frame rate back; it needs a port again (or env.txt edited) to turn off')
-    po.add_argument('--vulkan-driver', default=None, metavar='FILE',
+    po.add_argument('--vulkan-driver', default=None, metavar='[NAME=]FILE', action='append',
                     help='an arm64 Vulkan driver library (.so, such as Mesa\'s Turnip for Adreno) to pack in the APK and use instead of the device\'s own driver '
                          '(DM_VK_DRIVER in env.txt); the app falls back to the device\'s driver when the library does not load. A library not named lib*.so '
-                         '(vulkan.purple.so) is packed as lib<name>, the only names Android extracts')
+                         '(vulkan.purple.so) is packed as lib<name>, the only names Android extracts. Give it up to three times to pack several: the first is the default, '
+                         'and the pause menu\'s Driver tab picks among them and the system\'s for the next launch (Quit, then reopen); NAME= is the menu\'s name for it')
     po.add_argument('--shared-font', default=None, metavar='FILE',
                     help='a TrueType font (.ttf, one font, not a collection) to pack as the system font the game asks for, instead of the device\'s Roboto: one with CJK '
                          'characters shows the Chinese and Korean text of a game that draws it with the system font (DM_SHARED_FONT in env.txt); never shipped with the tool')

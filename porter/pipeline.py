@@ -33,7 +33,8 @@ class Options:
     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
-    vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
+    vulkan_driver: object = None       # arm64 Vulkan drivers (Mesa's Turnip) packed in the APK, used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c): a path,
+                                       # or a list of paths / 'NAME=path' strings; the first is the default, the pause menu's Driver tab picks among them (DM_VK_DRIVERS)
     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
     firmware: Path = None              # the player's system content files (.nca), for the profile's sysdata titles (extract_sysdata; DM_SYSDATA, dm/host/hle_fs.c)
     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
@@ -58,6 +59,36 @@ def driver_lib_name(path):
     Turnip T30 is vulkan.purple.so, other Turnip builds vulkan.freedreno.so) never reached the app's library folder, and adrenotools fell back to the system's driver"""
     name = Path(path).name
     return name if name.startswith('lib') else f'lib{name}'
+
+
+def driver_menu_name(path):
+    """The pause menu's name for a driver given without one: its file name less lib, vulkan and .so (vulkan.purple.so: purple)"""
+    n = Path(path).name
+    n = n[:-3] if n.endswith('.so') else n
+    n = re.sub(r'^lib', '', n); n = re.sub(r'^vulkan[._-]?', '', n)
+    return n or 'driver'
+
+
+def driver_specs(v):
+    """--vulkan-driver's values ([NAME=]FILE, one or more) as [(menu name, Path)]. The menu draws ASCII only, and ; and = separate DM_VK_DRIVERS' entries"""
+    if not v: return []
+    out = []
+    for s in ([v] if isinstance(v, (str, Path)) else list(v)):
+        name = ''
+        if isinstance(s, str) and '=' in s and not re.search(r'[\\/:]', s.split('=', 1)[0]): name, s = s.split('=', 1)
+        p = Path(s); name = re.sub(r'[^ -~]|[;=]', '', name.strip() or driver_menu_name(p)).strip()[:20] or 'driver'
+        out.append((name, p))
+    return out
+
+
+def driver_libs(specs):
+    """[(menu name, Path, its lib*.so name in the APK)]: driver_lib_name, made unique when two drivers have the same file name"""
+    seen, out = set(), []
+    for name, p in specs:
+        lib = driver_lib_name(p); stem, k = lib[:-3] if lib.endswith('.so') else lib, 2
+        while lib in seen: lib = f'{stem}_{k}.so'; k += 1
+        seen.add(lib); out.append((name, p, lib))
+    return out
 
 
 def app_stem(g, name):   # the file name of the APK and the data pack: the profile's iOS IPA name without .ipa (NeoTheWorldEndsWithYou)
@@ -172,6 +203,7 @@ class Port:
         self.o = opts
         self.cfg = config.load()
         self.result = {}
+        self.drivers = []    # [(menu name, source, lib name)] from --vulkan-driver (run: driver_libs)
         self.unpacked = {}   # NSZ / XCZ → its NSP in <build folder>/tmp/dumps/, while the port needs it
 
     # ---- the whole port ----
@@ -180,9 +212,10 @@ class Port:
         o.folder = Path(o.folder).expanduser().resolve()
         if not o.folder.is_dir(): raise BuildError(f'not a folder: {o.folder}')
         version_code('v0', o.vercode_offset); alias_headroom_gb(o.alias_headroom)   # an offset or headroom out of range fails now, not after the shaders
-        if o.vulkan_driver:
-            o.vulkan_driver = Path(o.vulkan_driver).expanduser().resolve()
-            if not o.vulkan_driver.is_file() or o.vulkan_driver.suffix != '.so': raise BuildError(f'--vulkan-driver: not a .so library: {o.vulkan_driver}')
+        self.drivers = driver_libs([(n, p.expanduser().resolve()) for n, p in driver_specs(o.vulkan_driver)])
+        for _, p, _ in self.drivers:
+            if not p.is_file() or p.suffix != '.so': raise BuildError(f'--vulkan-driver: not a .so library: {p}')
+        if len(self.drivers) > 3: raise BuildError('--vulkan-driver: three drivers at most (the pause menu\'s Driver tab: the system\'s and three)')
         if o.shared_font:
             o.shared_font = Path(o.shared_font).expanduser().resolve()
             if not o.shared_font.is_file() or o.shared_font.suffix.lower() != '.ttf': raise BuildError(f'--shared-font: not a .ttf font: {o.shared_font}')
@@ -683,7 +716,7 @@ class Port:
         PROG.stage('host', step=f'NDK {self.tools["ndk"].name}')
         out = self.aw / ('host-debug' if self.o.debug else 'host')
         nsp.run([PY, DM / 'android/build.py', '--game', self.g.id, '--ndk', self.tools['ndk'], '--out', out, '--lib', '--jobs', str(self.o.jobs)] + ([] if self.o.debug else ['--release'])
-                + (['--adrenotools'] if self.o.vulkan_driver else []), self.logs / 'android_host.log', env=self.env)
+                + (['--adrenotools'] if self.drivers else []), self.logs / 'android_host.log', env=self.env)
         self.so = out / 'libdmhost.so'
         if not self.so.is_file(): raise BuildError(f'build.py made no {self.so}')
         PROG.end(f'{self.so.stat().st_size / 2**20:.1f} MB')
@@ -697,14 +730,15 @@ class Port:
         code = version_code(self.pkg_ver, self.o.vercode_offset)
         if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
         external = self.external_activity() if self.o.external_display else []
-        driver = self.o.vulkan_driver
-        if driver and driver.name != driver_lib_name(driver):   # packed under a lib*.so name (driver_lib_name), copied beside the host library
-            driver = self.so.parent / driver_lib_name(driver); shutil.copyfile(self.o.vulkan_driver, driver)
-            say(f'--vulkan-driver: {self.o.vulkan_driver.name} is packed as {driver.name} (Android extracts only lib*.so libraries)')
+        packed = []
+        for name, src, lib in self.drivers:   # each under its lib*.so name (driver_libs), copied beside the host library when that is not its own
+            dst = src if src.name == lib else self.so.parent / lib
+            if dst != src: shutil.copyfile(src, dst); say(f'--vulkan-driver: {src.name} is packed as {lib} ("{name}" in the pause menu)')
+            packed.append(dst)
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
                  '--version-code', str(code), '--version-name', self.display]
                 + (['--landscape'] if self.ap.landscape else []) + icon + self.theme() + external + ([] if self.o.debug else ['--release'])
-                + [a for f in ([driver] + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if driver else []) for a in ('--extra-so', str(f))],
+                + [a for f in (packed + [self.so.parent / n for n in ADRENOTOOLS_LIBS] if packed else []) for a in ('--extra-so', str(f))],
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
@@ -759,7 +793,7 @@ class Port:
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
-                             + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else [])
+                             + ([f'DM_VK_DRIVER={self.drivers[0][2]}', 'DM_VK_DRIVERS=' + ';'.join(f'{n}={lib}' for n, _, lib in self.drivers)] if self.drivers else [])
                              + presets.env_rows(presets.get(self.o.preset), self.ap.env, self.o.gpu_turbo),
                              settings={**(presets.get(self.o.preset).settings if self.o.preset else {}), **(TOUCH_SETTINGS if self.o.touch else {})} or None,
                              files={**self.fps_files, **font_files},
