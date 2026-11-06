@@ -107,14 +107,19 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_DRIVER, OVM_DRUN, OVM_DQUIT, OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_DRIVER, OVM_DRUN, OVM_DQUIT, OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM, OVM_REC, OVM_HEAVY, OVM_MTREP, OVM_BATT, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c)
-#define OVM_TABS 4   // the open tab in dm_menu_state: bit 8 its low bit, bit 19 its high one
+#define OVM_TABS 5   // the open tab in dm_menu_state: bit 8, bit 19 and bit 29 (low to high)
 #define OVM_PER_TAB 4
 // Driver: the Vulkan driver for the next launch (the APK's DM_VK_DRIVERS and the system's), the one this launch runs on, and Quit, which the choice needs: a driver
 // is loaded once, before the game's first frame (gfx_vk_core.c vk_init). dm_menu_state bits 29..30: the chosen driver
 static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT},
-                                                         {OVM_DRIVER, OVM_DRUN, OVM_DQUIT, -1}, {OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM}};
+                                                         {OVM_DRIVER, OVM_DRUN, OVM_DQUIT, -1}, {OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM},
+                                                         {OVM_REC, OVM_HEAVY, OVM_MTREP, OVM_BATT}};
+// Tools: Record 60 s (perf_android.c dm_perf_record_start, closes the menu), Heavy mode (DM_NVN_ASYNC: the replay on a thread of its own, on the prime core; next
+// launch), MT replay (DM_VK_MT_REPLAY; next launch), Battery saver (30 fps, no container, no low latency; off puts the earlier choices back). Their values are not
+// in dm_menu_state: bit 23 turns over at each change (front_android.c g_set_ver, and each recording's start and end)
+int dm_tools_value(int item, char *v, int cap);   // front_android.c: the row's value; 1 when it is shown in the accent colour
 // Shader prewarm (DM_VK_PREWARM, for the next launch): At launch, Background, Off. Its value is not in dm_menu_state: bit 23 turns over at each change, and the
 // panel, redrawn, asks for it (front_android.c dm_prewarm_mode)
 static const char *const OVM_PREWARMS[3] = {"Off", "Background", "At launch"};
@@ -124,7 +129,7 @@ int dm_prewarm_mode(void);
 // (OVM_FCAPS' index), bit 27: the container; bit 24: the export count's low bit (a change of it redraws the panel). Low latency (perf_android.c dm_perf_set_lowlat):
 // each frame starts just in time for its slot rather than as soon as a texture is free; bit 7 (the highlighted row's top bit, never set: OVM_ROWS < 8)
 static const int OVM_FCAPS[4] = {0, 60, 40, 30};   // 0 = Auto
-static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game", "Driver", "Display"};
+static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game", "Driver", "Display", "Tools"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows (as many for every tab: the panel keeps its size), Resume
 static inline int ov_menu_item(int tab, int row) { return row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[(unsigned)tab < OVM_TABS ? tab : 0][row - 1] : -1; }
 #define OV_MENU_ROW 0.115f   // row height, of the window's height

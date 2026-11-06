@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include "dm.h"
+#include "perf_sample.h"
 
 typedef struct APerformanceHintManager APerformanceHintManager;
 typedef struct APerformanceHintSession APerformanceHintSession;
@@ -293,6 +294,71 @@ static void ll_record(int64_t w) {
     atomic_store(&g_ll_lead, v[(n * 95) / 100] + atomic_load(&g_ll_margin));
     { static unsigned k; if (++k % 600 == 0) LOG("[perf] low latency: lead %.1f ms (work p95 %.1f + margin %.1f)", atomic_load(&g_ll_lead) / 1e6, v[(n * 95) / 100] / 1e6, atomic_load(&g_ll_margin) / 1e6); }
 }
+// ---- the device's readings (perf_sample.h): the HUD's lines and the recording's columns, on their threads (sysfs, Java) ----
+static long rd_long(const char *p) { FILE *f = fopen(p, "r"); long v = -1; if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); } return v; }
+static int prime_cpu(void) {   // the core of the highest maximum clock (the 8 Gen 2's Cortex-X3), -1 unknown
+    static int c = -2; if (c != -2) return c;
+    long best = -1, n = sysconf(_SC_NPROCESSORS_CONF); c = -1; if (n > 32) n = 32;
+    for (long i = 0; i < n; i++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i); long m = rd_long(p); if (m > best) { best = m; c = (int)i; } }
+    return c;
+}
+// Android's thermal status (AThermal, API 30), for the HUD and the recording only: hle_nvn.c's dm_thermal_now stays the iOS front end's (its frame step's gates)
+static int hud_thermal(void) {
+    static int tried; static void *mgr; static int (*get)(void *);
+    if (!tried) { tried = 1; void *lib = dlopen("libandroid.so", RTLD_NOW); void *(*acq)(void) = lib ? (void *(*)(void))dlsym(lib, "AThermal_acquireManager") : NULL;
+                  get = lib ? (int (*)(void *))dlsym(lib, "AThermal_getCurrentThermalStatus") : NULL; mgr = acq && get ? acq() : NULL; }
+    return mgr ? get(mgr) : -1;
+}
+void dm_battery(int *pct, int *saver);   // front_android.c (BatteryManager, PowerManager through JNI)
+void dm_perf_sample(dm_sample *s) {
+    int c = prime_cpu(); char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c); long k = c >= 0 ? rd_long(p) : -1;
+    s->cpu_mhz = k > 0 ? k / 1000 : -1;
+    long hz = rd_long("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq"); if (hz <= 0) hz = rd_long("/sys/class/kgsl/kgsl-3d0/gpuclk");
+    s->gpu_mhz = hz > 0 ? hz / 1000000 : -1; s->gpu_busy = rd_long("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
+    s->thermal = hud_thermal();
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static int64_t bt; static int bp = -1, bs;   // the battery, at most every 10 s (Java)
+    pthread_mutex_lock(&mu); int64_t now = perf_now(); if (!bt || now - bt > 10000000000ll) { dm_battery(&bp, &bs); bt = now; } s->battery = bp; s->saver = bs; pthread_mutex_unlock(&mu);
+}
+// ---- the frame recording (the pause menu's Tools tab, Record 60 s): each frame's times as a row of perf-<date>-<time>.csv in the files folder (porter install pulls
+// them to the PC), with the device's readings every half second. The present thread only puts the row in a ring; a thread of its own writes the file
+typedef struct { int64_t t, iv, work, pq, gpu, target; } rec_row;
+#define REC_N 4096
+static rec_row g_rec[REC_N]; static _Atomic unsigned g_rec_w, g_rec_ver; static unsigned g_rec_r; static _Atomic int g_rec_st;   // 0 none yet, 1 recording, 2 saved, 3 failed
+static int64_t g_rec_t0, g_rec_until; static char g_rec_name[48];
+int dm_perf_record_state(char *name, int cap) { if (name && cap > 0) snprintf(name, (size_t)cap, "%s", g_rec_name); return atomic_load(&g_rec_st); }
+unsigned dm_perf_record_ver(void) { return atomic_load(&g_rec_ver); }
+static void *rec_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "dm perf record");
+    const char *root = getenv("DM_ROOT"); time_t tt = time(NULL); struct tm tm; localtime_r(&tt, &tm);
+    strftime(g_rec_name, sizeof g_rec_name, "perf-%Y%m%d-%H%M%S.csv", &tm);
+    char path[600]; snprintf(path, sizeof path, "%s/%s", root ? root : ".", g_rec_name); FILE *f = fopen(path, "w");
+    if (!f) { LOG("[RED] [perf] recording: cannot write %s", path); atomic_store(&g_rec_st, 3); atomic_fetch_add(&g_rec_ver, 1); return NULL; }
+    fprintf(f, "time_ms,frame_ms,work_ms,present_wait_ms,gpu_ms,target_ms,cpu_prime_mhz,gpu_mhz,gpu_busy_pct,thermal,battery_pct,battery_saver\n");
+    dm_sample s; dm_perf_sample(&s); int64_t next = perf_now() + 500000000; unsigned rows = 0;
+    for (;;) {
+        struct timespec ts = {0, 100000000}; nanosleep(&ts, NULL);
+        int64_t now = perf_now(); if (now >= next) { dm_perf_sample(&s); next = now + 500000000; }
+        unsigned w = atomic_load(&g_rec_w);
+        for (; g_rec_r != w; g_rec_r++, rows++) { const rec_row *r = &g_rec[g_rec_r % REC_N];
+            fprintf(f, "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%ld,%ld,%ld,%d,%d,%d\n", (r->t - g_rec_t0) / 1e6, r->iv / 1e6, r->work / 1e6, r->pq / 1e6, r->gpu / 1e6, r->target / 1e6,
+                    s.cpu_mhz, s.gpu_mhz, s.gpu_busy, s.thermal, s.battery, s.saver); }
+        if (now >= g_rec_until) break;
+    }
+    fclose(f); atomic_store(&g_rec_st, 2); atomic_fetch_add(&g_rec_ver, 1);
+    LOG("[perf] recording: %u frames saved to %s", rows, path);
+    return NULL;
+}
+void dm_perf_record_start(int seconds) {
+    if (atomic_load(&g_rec_st) == 1) return;
+    g_rec_r = atomic_load(&g_rec_w); g_rec_t0 = perf_now(); g_rec_until = g_rec_t0 + (int64_t)seconds * 1000000000; g_rec_name[0] = 0;
+    atomic_store(&g_rec_st, 1); atomic_fetch_add(&g_rec_ver, 1);
+    pthread_t t; if (pthread_create(&t, NULL, rec_thread, NULL)) { atomic_store(&g_rec_st, 3); return; } pthread_detach(t);
+    LOG("[perf] recording %d s of frames", seconds);
+}
+static void rec_push(int64_t t, int64_t iv, int64_t work, int64_t pq, int64_t target) {   // (the present thread)
+    unsigned w = atomic_load(&g_rec_w); if (w - g_rec_r >= REC_N) return;   // the writer behind: the row dropped
+    g_rec[w % REC_N] = (rec_row){t, iv, work, pq, g_frame_gpu, target}; atomic_store(&g_rec_w, w + 1);
+}
 void dm_perf_frame(double period) {
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
@@ -300,6 +366,7 @@ void dm_perf_frame(double period) {
     if (g_game_period && (int64_t)g_game_period < p) p = (int64_t)g_game_period;
     hint_init(p);
     { static unsigned n; if (++n % 60 == 0) gpu_turbo(); }
+    if (atomic_load(&g_rec_st) == 1 && g_prev_present) rec_push(t, t - g_prev_present, g_work_start ? t - g_prev_present - g_pace : -1, g_pq, STEPS[g_step] > p ? STEPS[g_step] : p);
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
         int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)

@@ -121,6 +121,10 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None
         model = adb.prop('ro.product.model')
         say(f'device: {model or dev} ({dev}), GPU {adb.gpu() or "unknown"}')
         harvest_pipelines(adb, files, Path(data).parent)
+        try:   # the pause menu's recordings (Tools, Record 60 s), into perf/ beside the data pack
+            got = adb.pull_new(files, Path(data).parent / 'perf', pattern=lambda n: n.startswith('perf-') and n.endswith('.csv'))
+            if got: say(f'frame recordings: {len(got)} pulled into {Path(data).parent / "perf"}')
+        except AdbError: pass
         if 'bcn' in man.get('requires', []):   # the profile's requires: BC-compressed textures
             bc = adb.bc_textures()
             if bc is False: raise BuildError(f'{man["name"]} needs BC-compressed textures, which this device\'s GPU ({adb.gpu()}) cannot read')

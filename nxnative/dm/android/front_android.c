@@ -79,6 +79,9 @@ static char g_drv_name[DRV_MAX + 1][24] = {"System"}, g_drv_lib[DRV_MAX + 1][96]
 static _Atomic int g_set_driver = -1;
 static _Atomic int g_set_prewarm = 2, g_set_ver;   // Shader prewarm (0 off, 1 background, 2 at launch; DM_VK_PREWARM at start-up); g_set_ver: its changes, for the panel
 int dm_prewarm_mode(void) { return atomic_load(&g_set_prewarm); }
+// Tools: Heavy mode and MT replay for the next launch (-1 none chosen: env.txt's; *_run what this launch has), Battery saver (and the choices it replaced)
+static _Atomic int g_set_heavy = -1, g_set_mtr = -1, g_set_batt; static int g_heavy_run, g_mtr_run, g_batt_prev[3];
+void dm_perf_record_start(int seconds); int dm_perf_record_state(char *name, int cap); unsigned dm_perf_record_ver(void);   // perf_android.c
 static _Atomic int g_set_fcap, g_set_cont, g_set_ll;   // the Display tab: Frame rate (OVM_FCAPS' index, 0 Auto), the 120 Hz container, Low latency
 void dm_perf_set_cap(int fps); void dm_perf_set_container(int on); void dm_perf_set_lowlat(int on);   // perf_android.c
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
@@ -98,6 +101,10 @@ static void settings_load(void) {
         else if (sscanf(line, "fpscap=%d", &v) == 1) { int k = 0; for (int i = 1; i < 4; i++) if (OVM_FCAPS[i] == v) k = i; atomic_store(&g_set_fcap, k); }   // 60, 40, 30; else Auto
         else if (sscanf(line, "container=%d", &v) == 1) atomic_store(&g_set_cont, v != 0);
         else if (sscanf(line, "lowlatency=%d", &v) == 1) atomic_store(&g_set_ll, v != 0);
+        else if (sscanf(line, "heavy=%d", &v) == 1) atomic_store(&g_set_heavy, v < 0 ? -1 : v != 0);
+        else if (sscanf(line, "mtreplay=%d", &v) == 1) atomic_store(&g_set_mtr, v < 0 ? -1 : v != 0);
+        else if (sscanf(line, "battery=%d", &v) == 1) atomic_store(&g_set_batt, v != 0);
+        else if (!strncmp(line, "battery_prev=", 13)) { int a, b, c; if (sscanf(line + 13, "%d,%d,%d", &a, &b, &c) == 3) { g_batt_prev[0] = a & 3; g_batt_prev[1] = b != 0; g_batt_prev[2] = c != 0; } }
         else if (sscanf(line, "prewarm=%d", &v) == 1) atomic_store(&g_set_prewarm, v < 0 ? 0 : v > 2 ? 2 : v);
         else if (sscanf(line, "driver=%d", &v) == 1) atomic_store(&g_set_driver, v < 0 ? -1 : v);   // (checked against the list in drivers_init)
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
@@ -118,7 +125,8 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
     if (atomic_load(&g_set_driver) >= 0) fprintf(f, "driver=%d\n", atomic_load(&g_set_driver));
-    fprintf(f, "prewarm=%d\n", atomic_load(&g_set_prewarm));
+    fprintf(f, "prewarm=%d\nheavy=%d\nmtreplay=%d\nbattery=%d\nbattery_prev=%d,%d,%d\n", atomic_load(&g_set_prewarm), atomic_load(&g_set_heavy), atomic_load(&g_set_mtr),
+            atomic_load(&g_set_batt), g_batt_prev[0], g_batt_prev[1], g_batt_prev[2]);
     fprintf(f, "fpscap=%d\ncontainer=%d\nlowlatency=%d\n", OVM_FCAPS[atomic_load(&g_set_fcap) & 3], atomic_load(&g_set_cont), atomic_load(&g_set_ll));
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
@@ -396,8 +404,8 @@ int dm_menu_state(void) {
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | (atomic_load(&g_set_fps) != 0) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 | (atomic_load(&g_set_ll) != 0) << 7 |
-           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 19 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_set_ver) & 1) << 23 | (atomic_load(&g_sv_n) & 1) << 24 | (atomic_load(&g_set_fcap) & 3) << 25 | (atomic_load(&g_set_cont) != 0) << 27 |
-           (atomic_load(&g_set_fps) == 2) << 28 | ((atomic_load(&g_set_driver) < 0 ? g_drv_run : atomic_load(&g_set_driver)) & 3) << 29;   // Show FPS at ALL: the counter, the frame-time graph and the GPU's load
+           (atomic_load(&g_menu_tab) & 1) << 8 | (atomic_load(&g_menu_tab) >> 1 & 1) << 19 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | ((atomic_load(&g_set_ver) + dm_perf_record_ver()) & 1) << 23 | (atomic_load(&g_sv_n) & 1) << 24 | (atomic_load(&g_set_fcap) & 3) << 25 | (atomic_load(&g_set_cont) != 0) << 27 |
+           (atomic_load(&g_set_fps) == 2) << 28 | (atomic_load(&g_menu_tab) >> 2 & 1) << 29;   // (the driver's choice: bit 23 turns over)   // Show FPS at ALL: the counter, the frame-time graph and the GPU's load
 }
 int dm_overlay_fps(void) { return atomic_load(&g_menu) ? 0 : atomic_load(&g_set_fps); }   // gfx_vk_present.c draws it (not while the menu holds the game): 0 none, 1 the counter, 2 the HUD
 static void menu_open(int hi) {
@@ -452,7 +460,37 @@ int dm_driver_names(char *sel, int scap, char *run, int rcap) {
     return d != g_drv_run;
 }
 static void fcap_step(int by) { int k = ((atomic_load(&g_set_fcap) + by) % 4 + 4) % 4; atomic_store(&g_set_fcap, k); dm_perf_set_cap(OVM_FCAPS[k]); settings_save(); }
-static void driver_step(int by) { int n = g_drv_n + 1, d = atomic_load(&g_set_driver); if (d < 0) d = g_drv_run; atomic_store(&g_set_driver, ((d + by) % n + n) % n); settings_save(); }
+static void driver_step(int by) { int n = g_drv_n + 1, d = atomic_load(&g_set_driver); if (d < 0) d = g_drv_run; atomic_store(&g_set_driver, ((d + by) % n + n) % n); atomic_fetch_add(&g_set_ver, 1); settings_save(); }
+// the battery (dm_perf_sample, every 10 s at most): BatteryManager's capacity and PowerManager's Battery Saver, through JNI on the caller's thread
+void dm_battery(int *pct, int *saver) {
+    *pct = -1; *saver = 0; JavaVM *vm = g_act ? g_act->vm : NULL; JNIEnv *E;
+    if (!vm || (*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK || (*E)->PushLocalFrame(E, 16)) return;
+    jobject a = g_act->clazz; jclass cA = (*E)->GetObjectClass(E, a); jmethodID gs = (*E)->GetMethodID(E, cA, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (gs) {
+        jobject bm = (*E)->CallObjectMethod(E, a, gs, (*E)->NewStringUTF(E, "batterymanager"));
+        if (!jx(E) && bm) { jmethodID gi = (*E)->GetMethodID(E, (*E)->GetObjectClass(E, bm), "getIntProperty", "(I)I"); int v = gi ? (*E)->CallIntMethod(E, bm, gi, 4) : -1; if (!jx(E) && v >= 0 && v <= 100) *pct = v; }
+        jobject pm = (*E)->CallObjectMethod(E, a, gs, (*E)->NewStringUTF(E, "power"));
+        if (!jx(E) && pm) { jmethodID ps = (*E)->GetMethodID(E, (*E)->GetObjectClass(E, pm), "isPowerSaveMode", "()Z"); jboolean on = ps ? (*E)->CallBooleanMethod(E, pm, ps) : 0; if (!jx(E)) *saver = on != 0; }
+    }
+    jx(E); (*E)->PopLocalFrame(E, NULL);
+}
+static void battery_saver(int on) {   // 30 fps, no container, no low latency; off: the choices it replaced
+    if (atomic_load(&g_set_batt) == on) return;
+    if (on) { g_batt_prev[0] = atomic_load(&g_set_fcap); g_batt_prev[1] = atomic_load(&g_set_cont); g_batt_prev[2] = atomic_load(&g_set_ll);
+              atomic_store(&g_set_fcap, 3); atomic_store(&g_set_cont, 0); atomic_store(&g_set_ll, 0); }
+    else { atomic_store(&g_set_fcap, g_batt_prev[0] & 3); atomic_store(&g_set_cont, g_batt_prev[1]); atomic_store(&g_set_ll, g_batt_prev[2]); }
+    atomic_store(&g_set_batt, on); atomic_fetch_add(&g_set_ver, 1);
+    dm_perf_set_cap(OVM_FCAPS[atomic_load(&g_set_fcap) & 3]); dm_perf_set_container(atomic_load(&g_set_cont)); dm_perf_set_lowlat(atomic_load(&g_set_ll));
+    LOG("[menu] battery saver %s", on ? "on: 30 fps, no 120 Hz container, no low latency" : "off: the earlier choices back"); settings_save();
+}
+int dm_tools_value(int item, char *v, int cap) {
+    if (item == OVM_REC) { char nm[48]; int st = dm_perf_record_state(nm, sizeof nm);
+        snprintf(v, (size_t)cap, "%s%s", st == 1 ? "Recording..." : st == 2 ? "Saved " : st == 3 ? "Failed" : "< Start >", st == 2 ? nm : ""); return st == 1 || st == 3; }
+    if (item == OVM_HEAVY || item == OVM_MTREP) { int set = atomic_load(item == OVM_HEAVY ? &g_set_heavy : &g_set_mtr), run = item == OVM_HEAVY ? g_heavy_run : g_mtr_run, cur = set >= 0 ? set : run;
+        snprintf(v, (size_t)cap, "< %s%s >", cur ? "On" : "Off", cur != run ? ", next launch" : ""); return cur != run; }
+    if (item == OVM_BATT) { int on = atomic_load(&g_set_batt); snprintf(v, (size_t)cap, "< %s >", on ? "On" : "Off"); return on; }
+    snprintf(v, (size_t)cap, "-"); return 0;
+}
 // Quit for the chosen driver: Activity.finishAndRemoveTask (on_destroy ends the process); reopened, the app loads it. Relaunching by itself would need an activity in a
 // process of its own: one that ends its own process while in front is taken off the screen, not started again
 static void driver_quit(void) {
@@ -478,6 +516,10 @@ static void menu_do(int item) {
     else if (item == OVM_IMPORT) { dm_haptics_android_tap(); sp_open(); return; }
     else if (item == OVM_DRIVER) driver_step(1);
     else if (item == OVM_FCAP) fcap_step(1);
+    else if (item == OVM_REC) { if (dm_perf_record_state(NULL, 0) != 1) { dm_haptics_android_tap(); dm_perf_record_start(60); menu_close(); } return; }   // in play: the menu closes
+    else if (item == OVM_HEAVY || item == OVM_MTREP) { _Atomic int *s = item == OVM_HEAVY ? &g_set_heavy : &g_set_mtr; int run = item == OVM_HEAVY ? g_heavy_run : g_mtr_run;
+        atomic_store(s, !(atomic_load(s) >= 0 ? atomic_load(s) : run)); atomic_fetch_add(&g_set_ver, 1); settings_save(); }
+    else if (item == OVM_BATT) battery_saver(!atomic_load(&g_set_batt));
     else if (item == OVM_PREWARM) { atomic_store(&g_set_prewarm, (atomic_load(&g_set_prewarm) + 2) % 3); atomic_fetch_add(&g_set_ver, 1); settings_save(); }   // At launch, Background, Off
     else if (item == OVM_LOWLAT) { int on = !atomic_load(&g_set_ll); atomic_store(&g_set_ll, on); dm_perf_set_lowlat(on); settings_save(); }
     else if (item == OVM_C120) { int on = !atomic_load(&g_set_cont); atomic_store(&g_set_cont, on); dm_perf_set_container(on); settings_save(); }
@@ -1177,6 +1219,11 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
     settings_load(); { char pw[4]; snprintf(pw, sizeof pw, "%d", atomic_load(&g_set_prewarm)); setenv("DM_VK_PREWARM", pw, 0); }   // (env.txt's wins: tests)
+    { int h = atomic_load(&g_set_heavy), m = atomic_load(&g_set_mtr);   // Tools: the next launch's choices, over env.txt's
+      if (h >= 0) { setenv("DM_NVN_ASYNC", h ? "1" : "0", 1); if (h) setenv("DM_PIN_REPLAY", "prime", 0); }
+      if (m >= 0) setenv("DM_VK_MT_REPLAY", m ? "1" : "0", 1);
+      const char *e = getenv("DM_NVN_ASYNC"); g_heavy_run = e && atoi(e) > 0; e = getenv("DM_VK_MT_REPLAY"); g_mtr_run = e && atoi(e) > 0;
+      if (h >= 0 || m >= 0) LOG("[menu] heavy mode %s, MT replay %s (Tools)", g_heavy_run ? "on" : "off", g_mtr_run ? "on" : "off"); }
     drivers_init(); dm_perf_set_cap(OVM_FCAPS[atomic_load(&g_set_fcap) & 3]); dm_perf_set_container(atomic_load(&g_set_cont)); dm_perf_set_lowlat(atomic_load(&g_set_ll));
     dm_haptics_android_start(act, atomic_load(&g_set_rumble));
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }

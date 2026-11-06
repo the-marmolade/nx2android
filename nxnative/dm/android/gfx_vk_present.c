@@ -10,6 +10,7 @@
 #include <time.h>
 #include "overlay_layout.h"
 #include "font5x7.h"
+#include "perf_sample.h"
 #include "overlay_vert.spv.h"
 #include "overlay_frag.spv.h"
 #include "rot_vert.spv.h"
@@ -72,6 +73,7 @@ __attribute__((weak)) int dm_menu_state(void) { return -1; }
 __attribute__((weak)) int dm_overlay_fps(void) { return 0; }   // front_android.c: the pause menu's Show FPS
 int dm_prewarm_progress(size_t *seen, size_t *total);   // gfx_vk_exec.c: 1 while the shader prewarm at launch holds the game
 __attribute__((weak)) int dm_prewarm_mode(void) { return 1; }   // front_android.c
+__attribute__((weak)) int dm_tools_value(int item, char *v, int cap) { (void)item; snprintf(v, (size_t)cap, "-"); return 0; }   // front_android.c
 __attribute__((weak)) int dm_driver_names(char *sel, int scap, char *run, int rcap) { snprintf(sel, (size_t)scap, "System"); snprintf(run, (size_t)rcap, "System"); return 0; }   // front_android.c
 __attribute__((weak)) int dm_save_note(char *out, int cap) { if (cap > 0) out[0] = 0; return OVX_IDLE; }   // front_android.c: the save manager's rows
 __attribute__((weak)) int dm_save_rows(ov_srow rows[OVM_ROWS]) { (void)rows; return 0; }
@@ -217,7 +219,7 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 // control drawn from it on each present; the procedural layer is then only the menu's panel, the dimming and the counter.
 enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_GREEN, SP_AMBER, SP_RED, SP_N };   // (black, white, accent: solid blocks, the dimming and the layout
                                                                                     //  editor's frames; green, amber, red: the performance HUD's frame-time bars)
-#define OV_FPS_CHARS "0123456789 FPS-GUms.%MHzADER/"   // (and the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
+#define OV_FPS_CHARS "0123456789 FPS-GUms.%MHzADER/CTBLOW"   // (and the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
                 VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
                 VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov;
@@ -379,13 +381,14 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
-                                              "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Shader prewarm", "Resume", ""};
+                                              "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Shader prewarm", "Record 60 s", "Heavy mode", "MT replay",
+                                              "Battery saver", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static void ov_menu_panel(const ov_canvas *cv, int st) {
     float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
     float rh = r[3], rw = r[2], gap = rh * 0.35f, sh = rh * 0.40f, sw = sh * 1.85f;
-    int tab = (st >> 8 & 1) | (st >> 19 & 1) << 1, sel = (st >> 4 & 7) - 1, op = st >> 9 & 127;
+    int tab = (st >> 8 & 1) | (st >> 19 & 1) << 1 | (st >> 29 & 1) << 2, sel = (st >> 4 & 7) - 1, op = st >> 9 & 127;
     int is = (int)fmaxf(1, roundf(rh * 0.30f / 7));
     for (; is > 1; is--) {   // the widest row: its label, a gap and its control
         float need = 0;
@@ -393,7 +396,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
             need = fmaxf(need, i == OVM_OPACITY ? fmaxf(lw / 0.38f, cv_text_w("80%", is) / 0.14f) : lw + gap + cw + rh * 0.3f);
         }
-        if (need <= rw && cv_text_w(OVM_TAB_NAMES[0], is) < rw / OVM_TABS - sh) break;
+        if (need <= rw) break;   // (the tabs' names are sized on their own)
     }
     cv_rrect(cv, 0, 0, p[2], p[3], rh * 0.18f, C_BG);
     for (int row = 0; row < OVM_ROWS; row++) {
@@ -404,7 +407,8 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             float th = rh * 0.62f, tw = rw / OVM_TABS;
             cv_rrect(cv, r[0], cy - th / 2, r[0] + rw, cy + th / 2, th / 2, C_OFF);
             cv_rrect(cv, r[0] + tab * tw, cy - th / 2, r[0] + (tab + 1) * tw, cy + th / 2, th / 2, C_ACCENT);
-            for (int k = 0; k < OVM_TABS; k++) cv_text(cv, r[0] + k * tw + (tw - cv_text_w(OVM_TAB_NAMES[k], is)) / 2, cy, OVM_TAB_NAMES[k], is, k == tab ? C_WHITE : C_DIM);
+            int ts = is; for (int k = 0; k < OVM_TABS; k++) while (ts > 1 && cv_text_w(OVM_TAB_NAMES[k], ts) > tw - th * 0.5f) ts--;   // five tabs: smaller names, not a smaller menu
+            for (int k = 0; k < OVM_TABS; k++) cv_text(cv, r[0] + k * tw + (tw - cv_text_w(OVM_TAB_NAMES[k], ts)) / 2, cy, OVM_TAB_NAMES[k], ts, k == tab ? C_WHITE : C_DIM);
             cv_rrect(cv, r[0], r[1] + rh - 1, r[0] + rw, r[1] + rh, 0.5f, C_LINE);
             continue;
         }
@@ -422,6 +426,10 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             snprintf(v, sizeof v, "%s", x == OVX_BUSY ? "Exporting..." : x == OVX_DONE ? nm : x == OVX_NOSAVE ? "No save yet" : "Failed");
             while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
             cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, x == OVX_FAILED ? C_ACCENT : C_WHITE);
+        } else if (it == OVM_REC || it == OVM_HEAVY || it == OVM_MTREP || it == OVM_BATT) {   // the Tools tab: its values (front_android.c)
+            char v[48]; int acc = dm_tools_value(it, v, sizeof v), vs = is;
+            while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
+            cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, acc ? C_ACCENT : C_WHITE);
         } else if (it == OVM_PREWARM) {   // the next launch's: At launch (accent), Background, Off
             int m = dm_prewarm_mode(), vs = is; char v[24]; snprintf(v, sizeof v, "< %s >", OVM_PREWARMS[m < 0 || m > 2 ? 1 : m]);
             while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
@@ -622,22 +630,21 @@ static void ov_frame(VkCommandBuffer cb, int sp, const float b[4], float t, floa
 #define OV_FT_N 120
 static float g_ft[OV_FT_N]; static int g_ft_i, g_ft_n;   // frame times, ms (a ring)
 static void ov_ft_push(float ms) { g_ft[g_ft_i] = ms; g_ft_i = (g_ft_i + 1) % OV_FT_N; if (g_ft_n < OV_FT_N) g_ft_n++; }
-static int kgsl_read(const char *path, long *v) { FILE *f = fopen(path, "r"); if (!f) return 0; int ok = fscanf(f, "%ld", v) == 1; fclose(f); return ok; }
 // KGSL's files are read on a thread of their own, twice a second while the HUD shows: a sysfs read can take milliseconds (the kernel samples the GPU), and made on the
 // present thread it held a frame's hand-over (one or two amber bars a second in a green graph). The thread idles when the HUD has not asked for a second, and ends for
 // good when the busy percentage cannot be read (the timestamps stand in)
-static _Atomic long g_kgsl_busy = -1, g_kgsl_mhz = -1; static _Atomic int64_t g_kgsl_want;   // the latest readings (-1 none); when the HUD last asked (perf clock)
+static _Atomic long g_kgsl_busy = -1, g_kgsl_mhz = -1, g_hud_cpu = -1; static _Atomic int g_hud_heat = -1, g_hud_bat = -1, g_hud_saver; static _Atomic int64_t g_kgsl_want;
+// (the latest readings, -1 none: perf_android.c dm_perf_sample; when the HUD last asked)
 static void *kgsl_thread(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "dm hud gpu"); int first = 1;
     for (;;) {
         struct timespec ts = {0, 500000000}, now; clock_gettime(CLOCK_MONOTONIC, &now);
         if ((int64_t)now.tv_sec * 1000000000 + now.tv_nsec - atomic_load(&g_kgsl_want) < 1000000000ll) {
-            long b = -1, hz = -1;
-            int ok = kgsl_read("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", &b);
-            if (!kgsl_read("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", &hz)) kgsl_read("/sys/class/kgsl/kgsl-3d0/gpuclk", &hz);
-            if (first) { first = 0; VKLOG("[perf] HUD: GPU load from %s", ok ? "KGSL (busy percentage and clock, read on its own thread)" : "the GPU's timestamps (KGSL's busy percentage refused or absent)"); }
-            if (!ok) { atomic_store(&g_kgsl_busy, -1); atomic_store(&g_kgsl_mhz, -1); return NULL; }
-            atomic_store(&g_kgsl_busy, b); atomic_store(&g_kgsl_mhz, hz > 0 ? hz / 1000000 : -1);
+            dm_sample s; dm_perf_sample(&s);
+            if (first) { first = 0; VKLOG("[perf] HUD: GPU load from %s; prime core %ld MHz, thermal status %d, battery %d%%", s.gpu_busy >= 0 ? "KGSL (busy percentage and clock)" :
+                                          "the GPU's timestamps (KGSL's busy percentage refused or absent)", s.cpu_mhz, s.thermal, s.battery); }
+            atomic_store(&g_kgsl_busy, s.gpu_busy); atomic_store(&g_kgsl_mhz, s.gpu_busy >= 0 ? s.gpu_mhz : -1); atomic_store(&g_hud_cpu, s.cpu_mhz);
+            atomic_store(&g_hud_heat, s.thermal); atomic_store(&g_hud_bat, s.battery); atomic_store(&g_hud_saver, s.saver);
         }
         nanosleep(&ts, NULL);
     }
@@ -676,16 +683,20 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     // the HUD: three lines and the graph on one block
     float last = g_ft_n ? g_ft[(g_ft_i + OV_FT_N - 1) % OV_FT_N] : 0, worst = 0; for (int i = 0; i < g_ft_n; i++) if (g_ft[i] > worst) worst = g_ft[i];
     float period = fps > 0 ? 1000.0f / (fps > 45 ? 60 : fps > 35 ? 40 : 30) : 1000.0f / 60;   // the step the game runs at (60, 40, 30)
-    char l2[32], l3[32];
+    char l2[32], l3[32], l4[32], l5[32];
     snprintf(l2, sizeof l2, "%.1fms %.1fms", last, worst);   // the latest frame, the worst in the graph
     if (busy >= 0 && mhz > 0) snprintf(l3, sizeof l3, "GPU %ld%% %ldMHz", busy > 100 ? 100 : busy, mhz);
     else if (busy >= 0) snprintf(l3, sizeof l3, "GPU %ld%%", busy > 100 ? 100 : busy);
     else if (gms >= 0) snprintf(l3, sizeof l3, "GPU %.1fms %d%%", gms, (int)(gpct > 100 ? 100 : gpct + 0.5f));
     else snprintf(l3, sizeof l3, "GPU --");
-    float gw = 16 * cw, gh = ch * 3, lh = ch + pad;
-    ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + 3 * lh + 3 * pad + gh, 0.5f);
+    { long c = atomic_load(&g_hud_cpu); int h = atomic_load(&g_hud_heat), b = atomic_load(&g_hud_bat);   // the prime core's clock and the thermal status (0 none .. 6)
+      int o = c > 0 ? snprintf(l4, sizeof l4, "CPU %ldMHz", c) : snprintf(l4, sizeof l4, "CPU --"); if (h >= 0) snprintf(l4 + o, sizeof l4 - (size_t)o, " HEAT %d", h);
+      o = b >= 0 ? snprintf(l5, sizeof l5, "BAT %d%%", b) : snprintf(l5, sizeof l5, "BAT --"); if (atomic_load(&g_hud_saver)) snprintf(l5 + o, sizeof l5 - (size_t)o, " LOW"); }
+    float gw = 18 * cw, gh = ch * 3, lh = ch + pad;
+    ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + 5 * lh + 3 * pad + gh, 0.5f);
     ov_line(cb, x, m + pad, cw, ch, s); ov_line(cb, x, m + pad + lh, cw, ch, l2); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3);
-    float gx = x, gy = m + 3 * lh + 2 * pad, top = period * 2.5f, bwid = (gw - ch * 0.5f) / OV_FT_N;   // the graph: 2.5 periods tall, new frames on the right
+    ov_line(cb, x, m + pad + 3 * lh, cw, ch, l4); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l5);
+    float gx = x, gy = m + 5 * lh + 2 * pad, top = period * 2.5f, bwid = (gw - ch * 0.5f) / OV_FT_N;   // the graph: 2.5 periods tall, new frames on the right
     for (int i = 0; i < g_ft_n; i++) {
         float ms = g_ft[(g_ft_i + OV_FT_N - g_ft_n + i) % OV_FT_N], hgt = (ms > top ? top : ms) / top * gh, bx = gx + (OV_FT_N - g_ft_n + i) * bwid;
         ov_block(cb, ms <= period * 1.05f ? SP_GREEN : ms <= period * 1.5f ? SP_AMBER : SP_RED, bx, gy + gh - hgt, bx + bwid * 0.8f + 0.5f, gy + gh, 0.9f);
