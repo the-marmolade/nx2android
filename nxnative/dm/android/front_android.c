@@ -82,7 +82,7 @@ static void settings_load(void) {
     char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
     if (!f) return;
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
-        else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
+        else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v < 0 ? 0 : v > 2 ? 2 : v);   // 1 the counter, 2 the HUD as well
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
@@ -378,10 +378,11 @@ int dm_menu_state(void) {
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
-    return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24;
+    return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | (atomic_load(&g_set_fps) != 0) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
+           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 |
+           (atomic_load(&g_set_fps) == 2) << 28;   // Show FPS at ALL: the counter, the frame-time graph and the GPU's load
 }
-int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
+int dm_overlay_fps(void) { return atomic_load(&g_menu) ? 0 : atomic_load(&g_set_fps); }   // gfx_vk_present.c draws it (not while the menu holds the game): 0 none, 1 the counter, 2 the HUD
 static void menu_open(int hi) {
     if (!atomic_load(&g_running) || atomic_exchange(&g_menu, 1)) return;
     atomic_store(&g_menu_hi, hi); g_menu_ptr = -1;
@@ -403,7 +404,7 @@ static void menu_close(void) {
     g_menu_ptr = -1; atomic_store(&g_menu_t, 0);
     hold_sync(); dm_haptics_suspend(4, 0); dm_overlay_redraw();
     LOG("[menu] closed: the game goes on (gamepad %s, opacity %d%%, rumble %s, frame rate %s, %s)", atomic_load(&g_set_overlay) ? "on" : "off", atomic_load(&g_set_opacity),
-        atomic_load(&g_set_rumble) ? "on" : "off", atomic_load(&g_set_fps) ? "shown" : "hidden", dm_opmode() ? "docked" : "handheld");
+        atomic_load(&g_set_rumble) ? "on" : "off", atomic_load(&g_set_fps) == 2 ? "shown with the HUD" : atomic_load(&g_set_fps) ? "shown" : "hidden", dm_opmode() ? "docked" : "handheld");
 }
 static void menu_opacity(int v) {   // the slider: a new value is drawn at once and saved when the finger lifts (menu_touch) or with each controller step
     v = v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v;
@@ -414,7 +415,7 @@ static void ed_open(void); static void sp_open(void); static void save_export(vo
 static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
-    else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
+    else if (item == OVM_FPS) { atomic_store(&g_set_fps, (atomic_load(&g_set_fps) + 1) % 3); settings_save(); }   // off, the counter, the HUD
     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
     else if (item == OVM_EDIT) { dm_haptics_android_tap(); ed_open(); return; }

@@ -28,6 +28,10 @@ def _parser():
     po.add_argument('--touch', action='store_true',
                     help='a game played by touch: the on-screen gamepad starts hidden, so every touch but the menu button\'s goes to the game (the pause menu shows it again; '
                          'the first launch\'s default: the app keeps the player\'s own settings)')
+    po.add_argument('--preset', default='', metavar='DEVICE',
+                    help='a device preset: env.txt and settings.txt defaults for a handheld, under the game profile\'s own (thor: the replay thread on the prime core, '
+                         'the on-screen gamepad hidden)')
+    po.add_argument('--gpu-turbo', action='store_true', help='DM_GPU_TURBO=1: an Adreno GPU held at its highest clock (more heat and battery; thermal limits still apply)')
     po.add_argument('--mt-replay', action='store_true',
                     help='multithread replay: the game\'s Vulkan commands are recorded on a thread of their own (DM_VK_MT_REPLAY=1 in env.txt), for a game whose replay '
                          'thread holds its frame rate back; it needs a port again (or env.txt edited) to turn off')
@@ -149,6 +153,9 @@ def cmd_port(a):
         env = os.environ.get('NX2A_VERCODE_OFFSET', '').strip() or '0'
         try: offset = int(env)
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
+    from porter import presets
+    try: presets.get(a.preset)
+    except ValueError as e: print(e, file=sys.stderr); return 2
     if (a.romfs_at is not None or a.romfs_push) and not a.install: print('--romfs-at and --romfs-push are install options: add --install, or run porter install after the port', file=sys.stderr); return 2
     from porter import install
     from porter.upstream import BuildError
@@ -156,7 +163,7 @@ def cmd_port(a):
     except BuildError as e: print(e, file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, firmware=Path(a.firmware) if a.firmware else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch, mt_replay=a.mt_replay, vulkan_driver=a.vulkan_driver, shared_font=a.shared_font,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, jobs=a.jobs)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, romfs_at=a.romfs_at, romfs_push=a.romfs_push, external_display=a.external_display, preset=a.preset, gpu_turbo=a.gpu_turbo, jobs=a.jobs)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 

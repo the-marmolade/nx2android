@@ -92,6 +92,8 @@ class PortTab(QWidget):
         self.shared_font.setToolTip('A TrueType font (.ttf) to pack as the system font the game asks for.\n'
                                     'One with CJK characters shows the Chinese and Korean text of a game that draws it with the system font.')
         self.mt_replay = QCheckBox('Multithread replay: record the game\'s Vulkan commands on a thread of their own (faster in busy scenes; port again to turn it off)')   # porter port --mt-replay
+        self.thor = QCheckBox('AYN Thor preset: the replay thread on the prime core, the on-screen gamepad hidden (built-in controls)')   # porter port --preset thor
+        self.gpu_turbo = QCheckBox('GPU turbo: hold an Adreno GPU at its highest clock (more heat and battery)')   # porter port --gpu-turbo
         self.debug = QCheckBox('Development build (debuggable, debug information, DM_CTL key presses)')
         self.experimental = QCheckBox('Experimental: try a game that is not ported to Android yet (it may not start)')
         self.experimental.toggled.connect(lambda _: self.update_port_button())
@@ -110,7 +112,7 @@ class PortTab(QWidget):
         f.addRow('Package', self.package); f.addRow('versionCode offset', self.vercode); f.addRow('Extra address space', headroom)
         f.addRow('Vulkan driver', path_row(self.driver, self.pick_driver))
         f.addRow('System font', path_row(self.shared_font, self.pick_shared_font))
-        f.addRow('', self.fps60); f.addRow('', self.touch); f.addRow('', self.mt_replay); f.addRow('', self.debug); f.addRow('', self.experimental)
+        f.addRow('', self.fps60); f.addRow('', self.touch); f.addRow('', self.mt_replay); f.addRow('', self.thor); f.addRow('', self.gpu_turbo); f.addRow('', self.debug); f.addRow('', self.experimental)
         v.addWidget(o)
 
         bar = QHBoxLayout()
@@ -215,6 +217,8 @@ class PortTab(QWidget):
         if self.fps60.isChecked(): args.append('--fps60')
         if self.touch.isChecked(): args.append('--touch')
         if self.mt_replay.isChecked(): args.append('--mt-replay')
+        if self.thor.isChecked(): args += ['--preset', 'thor']
+        if self.gpu_turbo.isChecked(): args.append('--gpu-turbo')
         if self.driver.text().strip(): args += ['--vulkan-driver', self.driver.text().strip()]
         if self.shared_font.text().strip(): args += ['--shared-font', self.shared_font.text().strip()]
         if self.debug.isChecked(): args.append('--debug')

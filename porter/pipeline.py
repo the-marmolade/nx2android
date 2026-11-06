@@ -7,7 +7,7 @@ import importlib.util, os, re, shutil, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, datapack, dumps, fpslocker, install, paths, profiles, toolchain
+from porter import config, datapack, dumps, fpslocker, install, paths, presets, profiles, toolchain
 from porter.adb import NO_ADB, Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say, trinity, uepak
@@ -39,6 +39,8 @@ class Options:
     mt_replay: bool = False            # multithread replay: DM_VK_MT_REPLAY=1 in env.txt (dm/android/gfx_vk_dq.c), after the profile's env rows
     touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
     external_display: bool = False     # compile the optional external-screen activity with the Android SDK
+    preset: str = ''                   # a device preset (porter/presets.py, e.g. 'thor'): env.txt rows the profile does not set, and settings.txt defaults
+    gpu_turbo: bool = False            # DM_GPU_TURBO=1 in env.txt: an Adreno GPU at its highest clock (perf_android.c gpu_turbo; thermal limits still apply)
     vercode_offset: int = 0            # added to the APK's versionCode: a rebuild of the same game version installs over a build with a higher one (version_code)
     alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
     romfs_at: str = None               # with install: the folder on the device the app reads the RomFS from (porter/install.py), 'app' for its files folder; None: as the device has it
@@ -757,7 +759,9 @@ class Port:
         dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
-                             + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
+                             + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else [])
+                             + presets.env_rows(presets.get(self.o.preset), self.ap.env, self.o.gpu_turbo),
+                             settings={**(presets.get(self.o.preset).settings if self.o.preset else {}), **(TOUCH_SETTINGS if self.o.touch else {})} or None,
                              files={**self.fps_files, **font_files},
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)

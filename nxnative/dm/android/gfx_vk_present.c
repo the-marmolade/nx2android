@@ -212,8 +212,9 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 // counter's characters (OV_FPS_CHARS, gh rows: one cell each), from which the counter is put together on every present, so a changing number needs no upload.
 // With a theme in the APK (overlay_theme.c), the gamepad is its sprites instead: an atlas per layout in a texture of its own (g_tt), uploaded once, every
 // control drawn from it on each present; the procedural layer is then only the menu's panel, the dimming and the counter.
-enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_N };   // (black, white, accent: solid blocks, the dimming and the layout editor's frames)
-#define OV_FPS_CHARS "0123456789 FPS-"
+enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_GREEN, SP_AMBER, SP_RED, SP_N };   // (black, white, accent: solid blocks, the dimming and the layout
+                                                                                    //  editor's frames; green, amber, red: the performance HUD's frame-time bars)
+#define OV_FPS_CHARS "0123456789 FPS-GUms.%MHz"   // (and the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
                 VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
                 VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov;
@@ -428,7 +429,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
             cv_disc(cv, on ? x1 - sh / 2 : sx0 + sh / 2, cy, sh / 2 - fmaxf(2, sh * 0.1f), on ? C_WHITE : C_KNOB_OFF);
-            const char *word = on ? "ON" : "OFF"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
+            const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : "ON"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
         }
     }
 }
@@ -534,7 +535,10 @@ static void ov_raster(uint8_t *px, uint32_t w, uint32_t h, uint32_t sh) {
     for (int i = 0; i < SP_N; i++) {   // the sprites (the knobs are drawn only as sprites, where the finger has them)
         float x = g_ov.sp[i][0], y = g_ov.sp[i][1], r = g_ov.sp[i][2], b[4] = {x, y, r, g_ov.sp[i][3]}; if (!r) continue;
         if (i == SP_DISC) cv_disc(&strip, x, y, r, C_WHITE);
-        else if (i == SP_BLACK || i == SP_WHITE || i == SP_ACCENT) { static const uint8_t k[4] = {0, 0, 0, 255}; cv_rrect(&strip, x - r, y - r, x + r, y + r, 0, i == SP_BLACK ? k : i == SP_WHITE ? C_WHITE : C_ACCENT); }
+        else if (i >= SP_BLACK && i <= SP_RED) {
+            static const uint8_t k[4] = {0, 0, 0, 255}, gr[4] = {70, 220, 110, 255}, am[4] = {255, 190, 40, 255}, rd[4] = {255, 70, 60, 255};
+            cv_rrect(&strip, x - r, y - r, x + r, y + r, 0, i == SP_BLACK ? k : i == SP_WHITE ? C_WHITE : i == SP_ACCENT ? C_ACCENT : i == SP_GREEN ? gr : i == SP_AMBER ? am : rd);
+        }
         else if (OV_CTLS[i].kind == OV_MENU) ov_menu_icon(&strip, &OV_CTLS[i], b);
         else if (OV_CTLS[i].kind == OV_BUTTON) cv_box(&strip, &OV_CTLS[i], b, fminf(b[2], b[3]) * 0.07f, C_WHITE);   // inset as the disc's 0.93
         else ov_circle(px, w, h + sh, x, y, r, 2.5f);
@@ -567,20 +571,6 @@ static void ov_fps_glyphs(void) {   // the characters into the rows under the pa
     ov_canvas cv = {g_ov.px, g_ov.w, 0, g_ov.h + g_ov.sh + g_ov.ph, g_ov.w, g_ov.gh};
     for (int i = 0; OV_FPS_CHARS[i]; i++) { char one[2] = {OV_FPS_CHARS[i], 0}; cv_text(&cv, i * ov_fps_cell() + 1 + g_ov.gs * 0.5f, g_ov.gh / 2.0f, one, (int)g_ov.gs, C_WHITE); }
 }
-static void ov_fps(VkCommandBuffer cb, int64_t now) {
-    static uint64_t n0; static int64_t t0; static int fps = -1;
-    uint64_t n = atomic_load(&g_fps_frames);
-    if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; }   // the first frame, or after a pause in the presents (the menu, the background): measure anew
-    else if (now - t0 >= 500000000ll) { fps = (int)((double)(n - n0) * 1e9 / (double)(now - t0) + 0.5); t0 = now; n0 = n; }
-    char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
-    float k = (float)g_sext.width / g_ov.w, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k, m = (float)g_sext.height * 0.02f, x = m + ch * 0.25f, pad = ch * 0.2f;
-    float bx = g_ov.sp[SP_BLACK][0], by = g_ov.sp[SP_BLACK][1], gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
-    ov_rect(cb, m, m, m + ch * 0.5f + strlen(s) * cw, m + ch + 2 * pad, bx - 2, by - 2, bx + 2, by + 2, 0.45f);
-    for (int i = 0; s[i]; i++, x += cw) {
-        const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
-        float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(); ov_rect(cb, x, m + pad, x + cw, m + pad + ch, u, gy, u + ov_fps_cell(), gy + g_ov.gh, 1);
-    }
-}
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
     float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
     for (int j = 0; j < t->n; j++) if (t->sp[j].state == OVT_DECOR) { const ov_ctl *c = &L[t->sp[j].ctl]; ov_box(c, W, H, b); ov_tsp(cb, t, &t->sp[j], b[0], b[1], k * ov_cscale(c), alpha); }
@@ -607,6 +597,66 @@ static void ov_block(VkCommandBuffer cb, int sp, float x0, float y0, float x1, f
 static void ov_frame(VkCommandBuffer cb, int sp, const float b[4], float t, float alpha) {   // a rectangle's outline around a control's box (b: ov_box), t pixels thick
     float x0 = b[0] - b[2] - t, x1 = b[0] + b[2] + t, y0 = b[1] - b[3] - t, y1 = b[1] + b[3] + t;
     ov_block(cb, sp, x0, y0, x1, y0 + t, alpha); ov_block(cb, sp, x0, y1 - t, x1, y1, alpha); ov_block(cb, sp, x0, y0 + t, x0 + t, y1 - t, alpha); ov_block(cb, sp, x1 - t, y0 + t, x1, y1 - t, alpha);
+}
+// The performance HUD (Show FPS at ALL, dm_overlay_fps 2): under the counter, the last OV_FT_N frame times as bars against the frame period's line (green within
+// the period, amber within 1.5 of it, red past that), the latest frame time and the worst in the graph, and the GPU's load. The GPU's load is KGSL's own busy
+// percentage and clock (/sys/class/kgsl/kgsl-3d0, Adreno) where the app may read them; elsewhere (SELinux refuses them on some firmware, or not Adreno) the GPU's
+// timestamped time per frame (gfx_vk_core.c g_gpu_ns) and its share of the wall clock, which says whether the frame is GPU-bound but not how hard the clock runs.
+#define OV_FT_N 120
+static float g_ft[OV_FT_N]; static int g_ft_i, g_ft_n;   // frame times, ms (a ring)
+static void ov_ft_push(float ms) { g_ft[g_ft_i] = ms; g_ft_i = (g_ft_i + 1) % OV_FT_N; if (g_ft_n < OV_FT_N) g_ft_n++; }
+static int kgsl_read(const char *path, long *v) { FILE *f = fopen(path, "r"); if (!f) return 0; int ok = fscanf(f, "%ld", v) == 1; fclose(f); return ok; }
+static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, const char *s) {   // a line of the counter's characters, its left edge at x
+    float gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
+    for (int i = 0; s[i]; i++, x += cw) {
+        const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
+        float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(); ov_rect(cb, x, y, x + cw, y + ch, u, gy, u + ov_fps_cell(), gy + g_ov.gh, 1);
+    }
+}
+extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all submissions
+static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
+    static uint64_t n0, nl; static int64_t t0, tl; static int fps = -1;
+    static int kgsl = -1; static long busy = -1, mhz = -1; static uint64_t g0; static float gms = -1, gpct = -1;   // kgsl: 1 readable, 0 refused, -1 not tried
+    uint64_t n = atomic_load(&g_fps_frames);
+    if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; g0 = g_gpu_ns; gms = gpct = -1; g_ft_n = 0; }   // the first frame, or after a pause in the presents: measure anew
+    else if (now - t0 >= 500000000ll) {
+        double dt = (double)(now - t0); uint64_t g = g_gpu_ns;
+        fps = (int)((double)(n - n0) * 1e9 / dt + 0.5);
+        if (n > n0 && g >= g0) { gms = (float)((double)(g - g0) / (double)(n - n0) / 1e6); gpct = (float)((double)(g - g0) * 100 / dt); }
+        if (level > 1 && kgsl != 0) {
+            long b = -1, hz = -1;
+            int ok = kgsl_read("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", &b);
+            if (!kgsl_read("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq", &hz)) kgsl_read("/sys/class/kgsl/kgsl-3d0/gpuclk", &hz);
+            if (kgsl < 0) VKLOG("[perf] HUD: GPU load from %s", ok ? "KGSL (busy percentage and clock)" : "the GPU's timestamps (KGSL's busy percentage refused or absent)");
+            kgsl = ok; busy = ok ? b : -1; mhz = hz > 0 ? hz / 1000000 : -1;
+        }
+        t0 = now; n0 = n; g0 = g;
+    }
+    if (level > 1 && n != nl) {   // a frame (or a few) shown since the last present: each one's share of the time since
+        if (tl && n > nl && now - tl < 1000000000ll) { float ms = (float)((double)(now - tl) / (double)(n - nl) / 1e6); for (uint64_t k = nl; k < n && k - nl < 4; k++) ov_ft_push(ms); }
+        tl = now; nl = n;
+    }
+    char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
+    float k = (float)g_sext.width / g_ov.w, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k, m = (float)g_sext.height * 0.02f, x = m + ch * 0.25f, pad = ch * 0.2f;
+    if (level < 2) { ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + strlen(s) * cw, m + ch + 2 * pad, 0.45f); ov_line(cb, x, m + pad, cw, ch, s); return; }
+    // the HUD: three lines and the graph on one block
+    float last = g_ft_n ? g_ft[(g_ft_i + OV_FT_N - 1) % OV_FT_N] : 0, worst = 0; for (int i = 0; i < g_ft_n; i++) if (g_ft[i] > worst) worst = g_ft[i];
+    float period = fps > 0 ? 1000.0f / (fps > 45 ? 60 : fps > 35 ? 40 : 30) : 1000.0f / 60;   // the step the game runs at (60, 40, 30)
+    char l2[32], l3[32];
+    snprintf(l2, sizeof l2, "%.1fms %.1fms", last, worst);   // the latest frame, the worst in the graph
+    if (busy >= 0 && mhz > 0) snprintf(l3, sizeof l3, "GPU %ld%% %ldMHz", busy > 100 ? 100 : busy, mhz);
+    else if (busy >= 0) snprintf(l3, sizeof l3, "GPU %ld%%", busy > 100 ? 100 : busy);
+    else if (gms >= 0) snprintf(l3, sizeof l3, "GPU %.1fms %d%%", gms, (int)(gpct > 100 ? 100 : gpct + 0.5f));
+    else snprintf(l3, sizeof l3, "GPU --");
+    float gw = 16 * cw, gh = ch * 3, lh = ch + pad;
+    ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + 3 * lh + 3 * pad + gh, 0.5f);
+    ov_line(cb, x, m + pad, cw, ch, s); ov_line(cb, x, m + pad + lh, cw, ch, l2); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3);
+    float gx = x, gy = m + 3 * lh + 2 * pad, top = period * 2.5f, bwid = (gw - ch * 0.5f) / OV_FT_N;   // the graph: 2.5 periods tall, new frames on the right
+    for (int i = 0; i < g_ft_n; i++) {
+        float ms = g_ft[(g_ft_i + OV_FT_N - g_ft_n + i) % OV_FT_N], hgt = (ms > top ? top : ms) / top * gh, bx = gx + (OV_FT_N - g_ft_n + i) * bwid;
+        ov_block(cb, ms <= period * 1.05f ? SP_GREEN : ms <= period * 1.5f ? SP_AMBER : SP_RED, bx, gy + gh - hgt, bx + bwid * 0.8f + 0.5f, gy + gh, 0.9f);
+    }
+    float py = gy + gh - period / top * gh; ov_block(cb, SP_WHITE, gx, py - 0.75f, gx + gw - ch * 0.5f, py + 0.75f, 0.5f);   // the frame period's line
 }
 static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
     float W = (float)g_sext.width, H = (float)g_sext.height, op = dm_overlay_opacity();
@@ -664,7 +714,7 @@ static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
             ov_rect(cb, p[0], p[1], p[0] + p[2], p[1] + p[3], pr[0], y0 + pr[1], pr[0] + pr[2], y0 + pr[1] + pr[3], 1);
         }
     }
-    if (fps && menu < 0) ov_fps(cb, now);
+    if (fps && menu < 0) ov_fps(cb, now, fps);
 }
 // the theme's atlas for a layout into its texture, once (overlay_theme.c reads it at the first present that shows the gamepad in that layout): copied in this
 // present's command buffer; its staging buffer goes at a later present, once the copy has run (its slot's fence signalled, or the slot came round again)
