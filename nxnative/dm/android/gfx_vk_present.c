@@ -395,7 +395,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
     for (; is > 1; is--) {   // the widest row: its label, a gap and its control
         float need = 0;
         for (int i = 0; i < OVM_RESUME; i++) {
-            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
+            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("AUTO", is);   // (the widest switch word)
             need = fmaxf(need, i == OVM_OPACITY ? fmaxf(lw / 0.38f, cv_text_w("80%", is) / 0.14f) : lw + gap + cw + rh * 0.3f);
         }
         if (need <= rw) break;   // (the tabs' names are sized on their own)
@@ -457,7 +457,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : it == OVM_LOWLAT ? 7 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
             cv_disc(cv, on ? x1 - sh / 2 : sx0 + sh / 2, cy, sh / 2 - fmaxf(2, sh * 0.1f), on ? C_WHITE : C_KNOB_OFF);
-            const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : "ON"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
+            const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : it == OVM_C120 ? "AUTO" : "ON";   // (the container: in use where it helps) cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
         }
     }
 }
@@ -668,7 +668,8 @@ static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, co
 }
 extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all submissions
 void dm_shader_stats(uint64_t *stall_n, uint64_t *stall_ns, uint64_t *bg_n);   // gfx_vk_exec.c: shader misses so far
-int dm_perf_container(void);   // perf_android.c: the 120 Hz container (the HUD's green limit)
+int dm_perf_container(void);   // perf_android.c: the 120 Hz container in use (the HUD's green limit and its mode line)
+int dm_perf_lowlat_state(void);   // perf_android.c: low latency 0 off, 1 in use, 2 standing aside, 3 stopped for this launch
 static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     static uint64_t n0, nl; static int64_t t0, tl; static int fps = -1;
     static uint64_t g0; static float gms = -1, gpct = -1;
@@ -722,12 +723,17 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
       if (atomic_load(&g_hud_saver)) snprintf(l5 + o, sizeof l5 - (size_t)o, " LOW"); }
     // "PSO 2 38ms BG 4": in the last second, pipelines the frame waited for (and its wait) and the ones built in the background (their draws left out meanwhile)
     char lp[32]; snprintf(lp, sizeof lp, "PSO %llu %.0fms BG %llu", (unsigned long long)(sw[0][0] + sw[1][0]), (double)(sw[0][1] + sw[1][1]) / 1e6, (unsigned long long)(sw[0][2] + sw[1][2]));
-    int nlines = ts[0] ? 7 : 6;
+    // the pacing modes in use, under the counter, only when one is (perf_android.c): "120Hz" the container; "LL" low latency, "LL PAUSE" standing aside
+    // (a frame needs over two periods), "LL STOP" stopped for this launch (frames kept missing their slots)
+    char lm[24] = ""; { int ll = dm_perf_lowlat_state(), o = dm_perf_container() ? snprintf(lm, sizeof lm, "120Hz") : 0;
+      if (ll) snprintf(lm + o, sizeof lm - (size_t)o, "%sLL%s", o ? " " : "", ll == 2 ? " PAUSE" : ll == 3 ? " STOP" : ""); }
+    const char *lines[8]; int hot[8] = {0}, nlines = 0;
+    lines[nlines++] = s; if (lm[0]) lines[nlines++] = lm;
+    lines[nlines++] = l2; lines[nlines++] = l3; lines[nlines++] = lp; lines[nlines++] = l4; hot[nlines] = hb; lines[nlines++] = l5;
+    if (ts[0]) { hot[nlines] = hs; lines[nlines++] = ts; }
     float gw = 18 * cw, gh = ch * 3, lh = ch + pad;
     ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + nlines * lh + 3 * pad + gh, 0.5f);
-    ov_line(cb, x, m + pad, cw, ch, s, 0); ov_line(cb, x, m + pad + lh, cw, ch, l2, 0); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3, 0);
-    ov_line(cb, x, m + pad + 3 * lh, cw, ch, lp, 0); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l4, 0); ov_line(cb, x, m + pad + 5 * lh, cw, ch, l5, hb);
-    if (ts[0]) ov_line(cb, x, m + pad + 6 * lh, cw, ch, ts, hs);
+    for (int i = 0; i < nlines; i++) ov_line(cb, x, m + pad + i * lh, cw, ch, lines[i], hot[i]);
     // green up to: 5% over the period; with the 120 Hz container half a refresh over it (a frame handed over a little late still makes its refresh, and one that
     // misses shows a whole refresh longer: 25 ms for 60 fps at 120 Hz, amber)
     float ok_ms = period * 1.05f;

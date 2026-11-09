@@ -166,9 +166,17 @@ void dm_perf_set_cap(int fps) {
 // The 120 Hz container (the pause menu): the window asks the display for DM_DISPLAY_HZ (120 by default) whatever the game's rate, rather than a rate the game's divides
 // (dm_perf_window), which let Android drop a 120 Hz panel to 60. The frames keep the game's period, paced on the display's vsync grid (gfx_vk_present.c pace_desired):
 // 60 fps two vsyncs a frame, 40 three, 30 four; no display mode change when the rate steps, and a 40 fps step that 60 Hz cannot pace evenly
-static _Atomic int g_container;
-void dm_perf_set_container(int on) { if (atomic_exchange(&g_container, on != 0) != (on != 0)) LOG("[perf] 120 Hz container %s (pause menu)", on ? "on" : "off"); }
-int dm_perf_container(void) { return atomic_load(&g_container); }
+// The menu's switch lets the container in only where it helps (Mario Kart 8 Deluxe on the AYN Thor, Turnip, a steady 60 fps: 6.6 frames a refresh late per
+// 5 s in the container against 1.3 at 60 Hz, perf-20261109-210809 / -211128): held at 40, which 60 Hz cannot pace evenly; on Auto from the governor's first
+// step below 60, and then for the rest of the launch (the rate steps again, and a container kept on changes no display mode). Held at 60 or 30, or Auto
+// at a steady 60: the display at the game's rate (dm_perf_window)
+static _Atomic int g_container, g_cont_engaged;   // the menu's switch; Auto has needed the container this launch
+void dm_perf_set_container(int on) { if (atomic_exchange(&g_container, on != 0) != (on != 0)) LOG("[perf] 120 Hz container %s (pause menu): in use when the frame rate is held at 40 or Auto steps below 60", on ? "allowed" : "off"); }
+int dm_perf_container(void) {   // the container in use now (gfx_vk_present.c asks the display for its rate when this changes; the HUD shows it)
+    if (!atomic_load(&g_container)) return 0;
+    int mp = atomic_load(&g_menu_pin);
+    return mp >= 0 ? mp == 1 : atomic_load(&g_cont_engaged);
+}
 uint64_t dm_present_period_adapt(uint64_t period) {
     { int mp = atomic_load(&g_menu_pin); if (mp >= 0 && period) { g_game_period = period; return (uint64_t)STEPS[mp] > period ? (uint64_t)STEPS[mp] : period; } }
     if (g_adapt < 0) { const char *e = getenv("DM_ADAPTIVE_FPS"); g_adapt = !(e && !atoi(e)); }
@@ -281,11 +289,23 @@ void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf
 // late against the first version's 7-17%, and 7-12 ms of the stock 34-40 ms saved). Over two periods low latency stands aside (0) until it is back under 90% of them. The margin starts at 2 ms, grows 1 ms for each frame that misses its slot (to 8 ms) and
 // comes back 0.5 ms after each 600 frames with none; the frames waiting ready in the queues are what it saves, the cost a frame that runs long misses its slot
 #define LL_N 32
+// It stops for the rest of the launch when frames keep missing their slots at the largest margin (LL_STOP_N within LL_STOP_NS): a game whose frame cost swings
+// that much loses more to the misses than it saves (Mario Kart 8 Deluxe on the AYN Thor, PurpleVK: 9.1 late frames per 5 s with it, 2.4 without,
+// perf-20261109-210141 / -210541). The menu's switch turned off and on again tries anew
+#define LL_STOP_N 3
+#define LL_STOP_NS 20000000000ll
 static _Atomic int g_lowlat; static _Atomic int64_t g_ll_lead, g_ll_margin = 2000000; static int64_t g_ll_work[LL_N]; static int g_ll_i, g_ll_n; static unsigned g_ll_ok;
-void dm_perf_set_lowlat(int on) { if (atomic_exchange(&g_lowlat, on != 0) != (on != 0)) { g_ll_n = 0; atomic_store(&g_ll_lead, 0); LOG("[perf] low latency %s (pause menu)", on ? "on" : "off"); } }
-static _Atomic int g_ll_aside;
-int64_t dm_perf_lowlat_lead(uint64_t period) {   // 0: off, not measured yet, or standing aside (a lead over two periods)
-    if (!atomic_load(&g_lowlat)) return 0;
+static _Atomic int g_ll_aside, g_ll_stop; static int64_t g_ll_miss[LL_STOP_N]; static unsigned g_ll_nmiss;
+void dm_perf_set_lowlat(int on) {
+    if (atomic_exchange(&g_lowlat, on != 0) == (on != 0)) return;
+    g_ll_n = 0; atomic_store(&g_ll_lead, 0); atomic_store(&g_ll_stop, 0); atomic_store(&g_ll_margin, 2000000); g_ll_nmiss = 0;
+    LOG("[perf] low latency %s (pause menu)", on ? "on" : "off");
+}
+int dm_perf_lowlat_state(void) {   // the HUD: 0 off, 1 in use, 2 standing aside (a lead over two periods), 3 stopped for this launch (frames kept missing)
+    return !atomic_load(&g_lowlat) ? 0 : atomic_load(&g_ll_stop) ? 3 : atomic_load(&g_ll_aside) ? 2 : 1;
+}
+int64_t dm_perf_lowlat_lead(uint64_t period) {   // 0: off, not measured yet, standing aside (a lead over two periods) or stopped
+    if (!atomic_load(&g_lowlat) || atomic_load(&g_ll_stop)) return 0;
     int64_t lead = atomic_load(&g_ll_lead); if (!lead || !period) return 0;
     int aside = atomic_load(&g_ll_aside), want = aside ? lead * 10 > (int64_t)(2 * period) * 9 : lead > (int64_t)(2 * period);
     if (want != aside && atomic_exchange(&g_ll_aside, want) != want)
@@ -294,7 +314,10 @@ int64_t dm_perf_lowlat_lead(uint64_t period) {   // 0: off, not measured yet, or
 }
 void dm_perf_lowlat_late(void) {
     int64_t m = atomic_load(&g_ll_margin); g_ll_ok = 0;
-    if (m < 8000000) { atomic_store(&g_ll_margin, m + 1000000); LOG("[perf] low latency: a frame missed its slot, margin %.1f ms", (m + 1000000) / 1e6); }
+    if (m < 8000000) { atomic_store(&g_ll_margin, m + 1000000); LOG("[perf] low latency: a frame missed its slot, margin %.1f ms", (m + 1000000) / 1e6); return; }
+    int64_t now = perf_now(); g_ll_miss[g_ll_nmiss++ % LL_STOP_N] = now;   // at the largest margin: the oldest of the last LL_STOP_N misses is next in the ring
+    if (g_ll_nmiss >= LL_STOP_N && now - g_ll_miss[g_ll_nmiss % LL_STOP_N] < LL_STOP_NS && !atomic_exchange(&g_ll_stop, 1))
+        LOG("[perf] low latency stopped for this launch: %d frames missed their slots within %.0f s at the largest margin (%.1f ms)", LL_STOP_N, LL_STOP_NS / 1e9, m / 1e6);
 }
 static void ll_record(int64_t w) {   // w: the frame's work; its replay's or GPU's time added here
     if (!atomic_load(&g_lowlat)) return;
@@ -390,6 +413,8 @@ void dm_perf_frame(double period) {
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
         int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)
         if (w > 0 && w < 250000000) { adapt_frame(w - pace > 0 ? w - pace : 0, t); ll_record(w - pq > 0 ? w - pq : w); if (g_hint) hint_report(w, pq, pace, t, g_hint_target); }
+        if (g_step > 0 && atomic_load(&g_menu_pin) < 0 && atomic_load(&g_container) && !atomic_exchange(&g_cont_engaged, 1))
+            LOG("[perf] 120 Hz container in use: Auto stepped to %.0f fps (kept for this launch)", 1e9 / STEPS[g_step]);
         g_work_start = 0;
     }
     g_prev_present = t;
