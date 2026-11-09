@@ -87,6 +87,8 @@ void dm_perf_record_start(int seconds); int dm_perf_record_state(char *name, int
 static _Atomic int g_set_fcap, g_set_cont, g_set_ll;   // the Display tab: Frame rate (OVM_FCAPS' index, 0 Auto), the 120 Hz container, Low latency
 static _Atomic int g_set_aa;   // the Graphics tab: Anti-aliasing (0 off, 1 FXAA, 2 SMAA; settings.txt aa=), read by the present (gfx_vk_present.c)
 int dm_aa_mode(void) { return atomic_load(&g_set_aa); }
+static _Atomic int g_set_up;   // the Graphics tab: Upscaling (0 bilinear, 1 FSR 1, 2 Snapdragon GSR 1; settings.txt upscale=), read by the present (gfx_vk_present.c pp_draw)
+int dm_upscale_mode(void) { return atomic_load(&g_set_up); }
 void dm_perf_set_cap(int fps); void dm_perf_set_container(int on); void dm_perf_set_lowlat(int on);   // perf_android.c
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
@@ -106,6 +108,7 @@ static void settings_load(void) {
         else if (sscanf(line, "fpscap=%d", &v) == 1) { int k = 0; for (int i = 1; i < 4; i++) if (OVM_FCAPS[i] == v) k = i; atomic_store(&g_set_fcap, k); }   // 60, 40, 30; else Auto
         else if (sscanf(line, "container=%d", &v) == 1) atomic_store(&g_set_cont, v != 0);
         else if (sscanf(line, "aa=%d", &v) == 1) atomic_store(&g_set_aa, v >= 0 && v <= 2 ? v : 0);
+        else if (sscanf(line, "upscale=%d", &v) == 1) atomic_store(&g_set_up, v >= 0 && v <= 2 ? v : 0);
         else if (sscanf(line, "lowlatency=%d", &v) == 1) atomic_store(&g_set_ll, v != 0);
         else if (sscanf(line, "heavy=%d", &v) == 1) atomic_store(&g_set_heavy, v < 0 ? -1 : v != 0);
         else if (sscanf(line, "mtreplay=%d", &v) == 1) atomic_store(&g_set_mtr, v < 0 ? -1 : v != 0);
@@ -134,7 +137,8 @@ static void settings_save(void) {
     if (atomic_load(&g_set_driver) >= 0) fprintf(f, "driver=%d\n", atomic_load(&g_set_driver));
     fprintf(f, "prewarm=%d\nheavy=%d\nmtreplay=%d\nbattery=%d\nbattery_prev=%d,%d,%d\n", atomic_load(&g_set_prewarm), atomic_load(&g_set_heavy), atomic_load(&g_set_mtr),
             atomic_load(&g_set_batt), g_batt_prev[0], g_batt_prev[1], g_batt_prev[2]);
-    fprintf(f, "fpscap=%d\ncontainer=%d\nlowlatency=%d\naa=%d\n", OVM_FCAPS[atomic_load(&g_set_fcap) & 3], atomic_load(&g_set_cont), atomic_load(&g_set_ll), atomic_load(&g_set_aa));
+    fprintf(f, "fpscap=%d\ncontainer=%d\nlowlatency=%d\naa=%d\nupscale=%d\n", OVM_FCAPS[atomic_load(&g_set_fcap) & 3], atomic_load(&g_set_cont), atomic_load(&g_set_ll),
+            atomic_load(&g_set_aa), atomic_load(&g_set_up));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
@@ -626,6 +630,8 @@ static void menu_do(int item) {
     else if (item == OVM_LOWLAT) { int on = !atomic_load(&g_set_ll); atomic_store(&g_set_ll, on); dm_perf_set_lowlat(on); settings_save(); }
     else if (item == OVM_C120) { int on = !atomic_load(&g_set_cont); atomic_store(&g_set_cont, on); dm_perf_set_container(on); settings_save(); }
     else if (item == OVM_AA) { int m = (atomic_load(&g_set_aa) + 1) % 3; atomic_store(&g_set_aa, m); atomic_fetch_add(&g_set_ver, 1); settings_save(); LOG("[menu] anti-aliasing %s", m == 2 ? "SMAA" : m ? "FXAA" : "off"); }   // Off, FXAA, SMAA
+    else if (item == OVM_UP) { int m = (atomic_load(&g_set_up) + 1) % 3; atomic_store(&g_set_up, m); atomic_fetch_add(&g_set_ver, 1); settings_save();
+                               LOG("[menu] upscaling %s", m == 2 ? "Snapdragon GSR 1" : m ? "FSR 1" : "bilinear"); }   // Bilinear, FSR 1, GSR
     else if (item == OVM_DRUN) return;   // (a note: the driver this launch runs on)
     else if (item == OVM_DQUIT) { dm_haptics_android_tap(); driver_quit(); return; }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
