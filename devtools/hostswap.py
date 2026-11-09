@@ -28,9 +28,9 @@ def main():
         src, out = Path(t) / 'installed.apk', Path(t) / 'host.apk'
         path = next(ln[8:].strip() for ln in adb(a.serial, 'shell', f'pm path {a.package}').stdout.splitlines() if ln.startswith('package:'))
         adb(a.serial, 'pull', path, str(src))
-        z = zipfile.ZipFile(src)
-        if LIB not in z.namelist(): raise SystemExit(f'{a.package}: not an nx2android port (no {LIB})')
-        entries = [(i.filename, lib if i.filename == LIB else z.read(i), 16384 if i.filename.startswith('lib/') else 4) for i in z.infolist()]
+        with zipfile.ZipFile(src) as z:   # (closed before the folder goes: Windows keeps an open file)
+            if LIB not in z.namelist(): raise SystemExit(f'{a.package}: not an nx2android port (no {LIB})')
+            entries = [(i.filename, lib if i.filename == LIB else z.read(i), 16384 if i.filename.startswith('lib/') else 4) for i in z.infolist()]
         kj = json.load(open(paths.signing_key())); k = {n: int(v) for n, v in kj.items() if n != 'cert'}; crt = bytes.fromhex(kj['cert'])
         zz, cd, eocd = build_zip(entries); out.write_bytes(sign_v2(zz, cd, eocd, k, crt))
         adb(a.serial, 'shell', f'am force-stop {a.package}')

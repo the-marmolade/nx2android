@@ -596,7 +596,10 @@ static void pass_rs_note(const vkimg_t *im) {
     float r = img_rs(im);
     if (g_pass_rs == 0) g_pass_rs = r;
     else if (g_pass_rs != r && !g_pass_rs_mixed) { g_pass_rs_mixed = 1; if (r > g_pass_rs) g_pass_rs = r;
-        static int n; if (n++ < 8) VKLOG("[RED] [vk] render scale: pass %d has scaled and unscaled targets (%ux%u, factor %.3f): drawn at the larger factor", g_sub_pass, im->w, im->h, r); }
+        static int n; if (n++ < 8) { char t[256]; int o = 0;   // the pass's attachments so far: size, own size, nvn format, levels
+            for (int i = 0; i < 9 && o < 200; i++) if (P_att[i].im) o += snprintf(t + o, sizeof t - (size_t)o, " %s%d=%ux%u(%ux%u) fmt %#x lv %u;", i == 8 ? "d" : "c", i == 8 ? 0 : i,
+                P_att[i].im->w, P_att[i].im->h, img_pw(P_att[i].im), img_ph(P_att[i].im), P_att[i].im->nvn_format, P_att[i].im->levels);
+            VKLOG("[RED] [vk] render scale: pass %d has scaled and unscaled targets (this one %ux%u fmt %#x factor %.3f; before it:%s): drawn at the larger factor", g_sub_pass, im->w, im->h, im->nvn_format, r, t); } }
 }
 static int begin_pass(void) {
     if (S.pass_open) return 1;

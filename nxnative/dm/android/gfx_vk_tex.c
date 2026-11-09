@@ -171,7 +171,7 @@ static VkFormat srgb_twin(VkFormat f) {
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
 // ---- render scale, prototype (DM_VK_RES_SCALE=1.3333 for 1440p from 1080p, 2 for 2160p; start-up): the game's full-size render targets are made larger and
 // drawn at that size, their viewports, scissors and copies scaled (gfx_vk_exec.c), the present reads them whole (gfx_vk_present.c). Full size: DM_VK_RES_BASE
-// (WxH, 1920x1080 by default: a docked game's). Scaled: a 2D (or 2D multisample) colour or depth target of exactly that size, one level and one layer, not
+// (WxH, 1920x1080 by default: a docked game's). Scaled: a 2D colour or depth target (or 2D array: Mario Kart 8 Deluxe draws its glow and particles into two layers of one, with its scaled depth; or multisample) of exactly that size, one level, not
 // block-compressed, not linear (the CPU reads linear ones). Not done: shaders that read texels by their position (texelFetch, image loads), or that work out
 // texture coordinates from the screen's size, still use the game's; images the CPU reads or the game fills from its memory (logged once each)
 float vk_res_scale(void) {
@@ -183,8 +183,12 @@ float vk_res_scale(void) {
 static float res_scale_of(const nvn_texdesc *d, const vkfmt_t *f, VkImageUsageFlags u) {
     float s = vk_res_scale(); if (s <= 1) return 1;
     static uint32_t bw, bh; if (!bw) { const char *e = getenv("DM_VK_RES_BASE"); if (!e || sscanf(e, "%ux%u", &bw, &bh) != 2 || !bw || !bh) { bw = 1920; bh = 1080; } }
-    if (d->width != bw || d->height != bh || (d->target != 1 && d->target != 5) || (d->levels > 1) || f->compressed || d->stride ||
-        (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || !(u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) return 1;
+    if (d->width != bw || d->height != bh) return 1;
+    const char *why = (d->target != 1 && d->target != 4 && d->target != 5 && d->target != 6) ? "target" : d->levels > 1 ? "levels" : f->compressed ? "compressed" : d->stride ? "stride" :
+                      (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ? "linear" :
+                      !(u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ? "no attachment usage" : NULL;
+    if (why) { static int n; if (n++ < 16) VKLOG("[vk] render scale: a %ux%u image not scaled (%s): nvn format %#x target %d levels %u flags %#x stride %u", d->width, d->height, why,
+                                                 d->format, d->target, d->levels, d->flags, d->stride); return 1; }
     return s;
 }
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
