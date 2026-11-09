@@ -311,7 +311,7 @@ static void lrz_touch(vkimg_t *im, int write) {
         VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, b, m, 0)); }
     VkCommandBuffer cb = vk_cmd();
     VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {1, 1, 1}};
-    if ((g_lrz_touch & LRZ_CORNER) && im->w && im->h) c.imageOffset = (VkOffset3D){(int32_t)im->w - 1, (int32_t)im->h - 1, 0};
+    if ((g_lrz_touch & LRZ_CORNER) && im->w && im->h) c.imageOffset = (VkOffset3D){(int32_t)img_pw(im) - 1, (int32_t)img_ph(im) - 1, 0};
     vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c); vk_img_barrier_all(cb);   // (begin_pass's barrier already ordered it after the writes)
     if (write) { vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c); vk_img_barrier_all(cb); }
 }
@@ -589,6 +589,15 @@ void vk_end_pass(void) {
 // copies, the submission's end): the deferred uniform updates land first (draws read them through their shadows, so ordinary pass ends keep them)
 void vk_end_pass_land(void) { vk_end_pass(); if (vk_sub_open()) vk_ubd_land(vk_cmd()); }
 static int pass_whole(VkRect2D r) { return !r.offset.x && !r.offset.y && r.extent.width >= S.pass_w && r.extent.height >= S.pass_h; }
+// Render scale (prototype, gfx_vk_tex.c res_scale_of): the open pass's factor, from its attachments; the game's viewports, scissors and clear rectangles are in its
+// own pixels and are multiplied by it (set_dynamic, scissor_rect). Attachments of different factors in one pass (a scaled target with an unscaled one) are logged
+static float g_pass_rs = 1; static int g_pass_rs_mixed;
+static void pass_rs_note(const vkimg_t *im) {
+    float r = img_rs(im);
+    if (g_pass_rs == 0) g_pass_rs = r;
+    else if (g_pass_rs != r && !g_pass_rs_mixed) { g_pass_rs_mixed = 1; if (r > g_pass_rs) g_pass_rs = r;
+        static int n; if (n++ < 8) VKLOG("[RED] [vk] render scale: pass %d has scaled and unscaled targets (%ux%u, factor %.3f): drawn at the larger factor", g_sub_pass, im->w, im->h, r); }
+}
 static int begin_pass(void) {
     if (S.pass_open) return 1;
     int psplit = g_psplit_now; g_psplit_now = 0;   // a pass split (prepare_draw): taken before any early return, so the flag never forces a later pass's cut
@@ -596,7 +605,7 @@ static int begin_pass(void) {
     VkRenderingAttachmentInfo *ca = P_ca; memset(ca, 0, sizeof P_ca);
     for (int i = 0; i < 9; i++) P_att[i].im = NULL;
     VkRenderingAttachmentInfo da = {0}, sa = {0};
-    uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX, samples = 1; int ncol = 0, have = 0;
+    uint32_t w = UINT32_MAX, h = UINT32_MAX, layers = UINT32_MAX, samples = 1; int ncol = 0, have = 0; g_pass_rs = 0; g_pass_rs_mixed = 0;
     for (int i = 0; i < S.rt_n; i++) {
         S.cfmt[i] = VK_FORMAT_UNDEFINED;
         ca[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO; ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL; ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -605,7 +614,7 @@ static int begin_pass(void) {
         if (!v) continue;
         vk_tex_prepare(cb, im);
         uint32_t lv = S.rt_has_cview[i] && S.rt_cview[i].set_levels ? S.rt_cview[i].base_level : 0;
-        uint32_t iw = im->w >> lv ? im->w >> lv : 1, ih = im->h >> lv ? im->h >> lv : 1;
+        uint32_t iw = img_pw(im) >> lv ? img_pw(im) >> lv : 1, ih = img_ph(im) >> lv ? img_ph(im) >> lv : 1; pass_rs_note(im);   // (its own size: render scale)
         // a block-compressed texture drawn into through an uncompressed view (RGBA32UI over BC3: one texel per 4x4 block, Mario Kart 8 Deluxe compressing its
         // reflection cubemaps on the GPU) is that view's size in blocks: with the texel size the render area was 16 times the attachment, which Vulkan does not allow (the render area must lie within every attachment view)
         { const vkfmt_t *tf = vk_fmt(S.rt_col[i].d.format), *vf = S.rt_has_cview[i] && S.rt_cview[i].set_format ? vk_fmt(S.rt_cview[i].format) : tf;
@@ -629,7 +638,7 @@ static int begin_pass(void) {
         if (v) {
             vk_tex_prepare(cb, im);
             uint32_t lv = S.rt_has_dview && S.rt_dview.set_levels ? S.rt_dview.base_level : 0;
-            uint32_t iw = im->w >> lv ? im->w >> lv : 1, ih = im->h >> lv ? im->h >> lv : 1;
+            uint32_t iw = img_pw(im) >> lv ? img_pw(im) >> lv : 1, ih = img_ph(im) >> lv ? img_ph(im) >> lv : 1; pass_rs_note(im);
             if (iw < w) w = iw; if (ih < h) h = ih; samples = im->samples; have = 1;
             da = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, v, VK_IMAGE_LAYOUT_GENERAL, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
             S.dfmt = im->fmt; S.daspect = im->aspect; P_att[8].im = im; P_att[8].fmt = vk_view_fmt; P_att[8].layers = vk_view_layers ? vk_view_layers : 1; P_att[8].w = iw; P_att[8].h = ih;
@@ -668,12 +677,14 @@ static int begin_pass(void) {
     P_ri = (VkRenderingInfo){VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, {w, h}}, layers, 0, (uint32_t)ncol, P_ca,
                              (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &P_da : NULL, (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &P_sa : NULL};
     S.pass_open = 2; S.pass_w = w; S.pass_h = h; S.samples = samples; S.ncol = ncol; S.bound_pipe = VK_NULL_HANDLE;
+    if (g_pass_rs <= 0) g_pass_rs = 1;
     return 1;
 }
 static VkRect2D scissor_rect(void) {
     int32_t x = 0, y = 0; int64_t x1 = S.pass_w, y1 = S.pass_h;
     if (S.sc_set) {
         int64_t sx = S.sc.x, sy = S.sc.y, sx1 = (int64_t)S.sc.x + S.sc.w, sy1 = (int64_t)S.sc.y + S.sc.h;
+        if (g_pass_rs != 1) { float r = g_pass_rs; sx = (int64_t)floorf(sx * r); sy = (int64_t)floorf(sy * r); sx1 = (int64_t)ceilf(sx1 * r); sy1 = (int64_t)ceilf(sy1 * r); }   // (render scale)
         if (g_lower_left && !g_flipy) { int64_t t = (int64_t)S.pass_h - sy1; sy1 = (int64_t)S.pass_h - sy; sy = t; }
         if (sx > x) x = (int32_t)sx; if (sy > y) y = (int32_t)sy; if (sx1 < x1) x1 = sx1; if (sy1 < y1) y1 = sy1;
     }
@@ -1486,6 +1497,7 @@ static void set_dynamic(VkCommandBuffer cb) {
     int fresh = bc_fresh();
     float x = S.vp[0][0], y = S.vp[0][1], w = S.vp[0][2], h = S.vp[0][3];
     if (w == 0 && h == 0) { w = (float)S.pass_w; h = (float)S.pass_h; }
+    else if (g_pass_rs != 1) { x *= g_pass_rs; y *= g_pass_rs; w *= g_pass_rs; h *= g_pass_rs; }   // (render scale: the game's viewport in its own pixels)
     VkViewport vp = {x, y, w, h, S.dnear, S.dfar};
     if (g_lower_left && !g_flipy) { vp.y = (float)S.pass_h - y; vp.height = -h; }   // lower-left viewports count y from the bottom
     else if (!g_lower_left && g_flipy) { vp.y = y + h; vp.height = -h; }        // clip space y up over the same top-left rectangle
@@ -2143,6 +2155,7 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
         for (uint32_t z = 0; z < nz; z++) vk_bc_decode(f, (const uint8_t *)(uintptr_t)c->src + z * slice, pitch, w, h, 1, p + z * out);
         b = sb; r.bufferOffset = so; r.bufferRowLength = 0; r.bufferImageHeight = 0;
     }
+    if (im->rs > 1) { static int n; if (n++ < 8) VKLOG("[RED] [vk] render scale: a scaled %ux%u target copied %s a buffer (%dx%d at %d,%d of the game's pixels): the top-left part of its texels (prototype)", im->w, im->h, to_texture ? "from" : "to", c->r.width, c->r.height, c->r.xoffset, c->r.yoffset); }
     if (g_watch_off >= 0) { char w[96]; snprintf(w, sizeof w, "buffer copy %s (buffer %#llx, %dx%d)", to_texture ? "destination" : "source", (unsigned long long)c->src, c->r.width, c->r.height); vk_watch(im, w); }
     if (to_texture) { vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r); im->gpu_w = 1; }
     else { vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
@@ -2232,6 +2245,15 @@ static void copy_t2t(const p_copy_t2t *c) {
     if (k.dr.xoffset + k.dr.width > dw) { VKRED_ONCE(74, "texture copy destination region clipped to its image"); k.dr.width = dw - k.dr.xoffset; if (same) k.sr.width = k.dr.width; }
     if (k.dr.yoffset + k.dr.height > dh) { VKRED_ONCE(74, "texture copy destination region clipped to its image"); k.dr.height = dh - k.dr.yoffset; if (same) k.sr.height = k.dr.height; }
     if (k.sr.width <= 0 || k.sr.height <= 0 || k.dr.width <= 0 || k.dr.height <= 0) { vk_img_barrier_all(cb); return; }
+    if (img_rs(s) != 1 || img_rs(d) != 1) {   // render scale (prototype): each region in its image's own texels; a copy between two factors becomes a blit (below)
+        float rs = img_rs(s), rd = img_rs(d); int32_t spw = (int32_t)(img_pw(s) >> ss.mipLevel), sph = (int32_t)(img_ph(s) >> ss.mipLevel), dpw = (int32_t)(img_pw(d) >> ds.mipLevel), dph = (int32_t)(img_ph(d) >> ds.mipLevel);
+        k.sr.xoffset = (int)lroundf(k.sr.xoffset * rs); k.sr.yoffset = (int)lroundf(k.sr.yoffset * rs); k.sr.width = (int)lroundf(k.sr.width * rs); k.sr.height = (int)lroundf(k.sr.height * rs);
+        k.dr.xoffset = (int)lroundf(k.dr.xoffset * rd); k.dr.yoffset = (int)lroundf(k.dr.yoffset * rd); k.dr.width = (int)lroundf(k.dr.width * rd); k.dr.height = (int)lroundf(k.dr.height * rd);
+        if (k.sr.xoffset + k.sr.width > spw) k.sr.width = spw - k.sr.xoffset; if (k.sr.yoffset + k.sr.height > sph) k.sr.height = sph - k.sr.yoffset;
+        if (k.dr.xoffset + k.dr.width > dpw) k.dr.width = dpw - k.dr.xoffset; if (k.dr.yoffset + k.dr.height > dph) k.dr.height = dph - k.dr.yoffset;
+        if (rs != rd) { static int n; if (n++ < 8) VKLOG("render scale: copy %ux%u (factor %.3f) → %ux%u (factor %.3f): a blit", s->w, s->h, rs, d->w, d->h, rd); }
+        if (k.sr.width <= 0 || k.sr.height <= 0 || k.dr.width <= 0 || k.dr.height <= 0) { vk_img_barrier_all(cb); return; }
+    }
     if (!(c->flags & DM_COPY_RESOLVE) && !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt)) {   // a blit: both formats must allow it (and linear filtering)
         VkFormatProperties sp, dp; vkGetPhysicalDeviceFormatProperties(V.pd, s->fmt, &sp); vkGetPhysicalDeviceFormatProperties(V.pd, d->fmt, &dp);
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(dp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || (s->aspect != d->aspect)) {

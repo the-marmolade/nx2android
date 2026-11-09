@@ -9,6 +9,7 @@
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
 #include <string.h>
+#include <math.h>
 #include "../gfx/tex/nvn_bc.h"
 
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp);
@@ -168,6 +169,24 @@ static VkFormat srgb_twin(VkFormat f) {
 // Graveyard Keeper 2, Advance Wars and DKCR drew the same pictures. A colour view in another format than the image's and its twin is logged [RED] (vk_tex_view):
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
+// ---- render scale, prototype (DM_VK_RES_SCALE=1.3333 for 1440p from 1080p, 2 for 2160p; start-up): the game's full-size render targets are made larger and
+// drawn at that size, their viewports, scissors and copies scaled (gfx_vk_exec.c), the present reads them whole (gfx_vk_present.c). Full size: DM_VK_RES_BASE
+// (WxH, 1920x1080 by default: a docked game's). Scaled: a 2D (or 2D multisample) colour or depth target of exactly that size, one level and one layer, not
+// block-compressed, not linear (the CPU reads linear ones). Not done: shaders that read texels by their position (texelFetch, image loads), or that work out
+// texture coordinates from the screen's size, still use the game's; images the CPU reads or the game fills from its memory (logged once each)
+float vk_res_scale(void) {
+    static float s = -1;
+    if (s < 0) { const char *e = getenv("DM_VK_RES_SCALE"); s = e ? strtof(e, NULL) : 1.0f; if (!(s > 1.01f && s <= 3.0f)) s = 1.0f;
+                 if (s > 1) VKLOG("[vk] render scale %.4f (DM_VK_RES_SCALE, prototype)", s); }
+    return s;
+}
+static float res_scale_of(const nvn_texdesc *d, const vkfmt_t *f, VkImageUsageFlags u) {
+    float s = vk_res_scale(); if (s <= 1) return 1;
+    static uint32_t bw, bh; if (!bw) { const char *e = getenv("DM_VK_RES_BASE"); if (!e || sscanf(e, "%ux%u", &bw, &bh) != 2 || !bw || !bh) { bw = 1920; bh = 1080; } }
+    if (d->width != bw || d->height != bh || (d->target != 1 && d->target != 5) || (d->levels > 1) || f->compressed || d->stride ||
+        (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || !(u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) return 1;
+    return s;
+}
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     vkimg_t *im = calloc(1, sizeof *im);
     const nvn_texdesc *d = &t->d;
@@ -184,12 +203,15 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     // reflection cubemaps through RGBA32UI views): with EXTENDED_USAGE the image may carry a usage its own format lacks, and an attachment view needs it on the image
     if (f->compressed && !f->dec && (f->bpb == 16 || f->bpb == 8)) { VkFormatProperties up; vkGetPhysicalDeviceFormatProperties(V.pd, f->bpb == 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32_UINT, &up);
         if (up.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; }
+    { float rs = res_scale_of(d, f, u);   // render scale (prototype): the image larger than the game's size
+      if (rs > 1) { im->rs = rs; im->pw = (uint32_t)lroundf(im->w * rs); im->ph = (uint32_t)lroundf(im->h * rs);
+                    static int n; if (n++ < 8) VKLOG("[vk] render scale: %ux%u target (nvn format %#x) made %ux%u", im->w, im->h, d->format, im->pw, im->ph); } }
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL,
         // a square 2D array of 6n layers too: shaders read one as a cube (Pokémon Legends: Arceus's reflection probes; the view was refused by the validation layer without the flag)
         VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | (d->target == 8 || d->target == 9 || (d->target == 4 && im->layers >= 6 && im->layers % 6 == 0 && im->w == im->h && im->samples <= 1) ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
         (d->target == 2 ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0) | (f->compressed ? VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT : 0),
         d->target == 2 ? VK_IMAGE_TYPE_3D : d->target == 0 || d->target == 3 ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D, f->vk,
-        {im->w, im->h, im->d}, im->levels, im->layers, (VkSampleCountFlagBits)im->samples, VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        {img_pw(im), img_ph(im), im->d}, im->levels, im->layers, (VkSampleCountFlagBits)im->samples, VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (im->samples > 1) ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkFormat fl[2] = {f->vk, srgb_twin(f->vk)}; VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, fl[1] ? 2u : 1u, fl};
     if (!f->compressed && (ubwc_mode() & (im->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? 1 : 2))) {   // (a depth format has no twin: a list of itself, no MUTABLE_FORMAT)
@@ -257,6 +279,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
     if (!bpb) { VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return; }
+    if (im->rs > 1) VKRED_ONCE(130, "render scale: a scaled %ux%u target (nvn format %#x) filled from the game's memory: only its top-left %ux%u has the texels (prototype)", im->w, im->h, t->d.format, im->w, im->h);
     for (unsigned lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = im->d >> lv ? im->d >> lv : 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, slab = pitch * by * z;

@@ -114,6 +114,8 @@ struct vkimg {
     uint64_t depth_cut;   // and the command buffer within it (gfx_vk_exec.c g_cuts)
     int fixed_fmt;   // created with a format list (DM_VK_UBWC): views only in its format or its sRGB twin
     VkFormat fmt2;   // with fixed_fmt: the other format of its list (its sRGB twin), VK_FORMAT_UNDEFINED when the list is its format alone
+    uint32_t pw, ph; float rs;   // render scale (gfx_vk_tex.c res_scale_of, DM_VK_RES_SCALE): the image's own size in texels (w, h stay the game's), its factor;
+                                 // 0 = not scaled (img_pw, img_ph, img_rs)
     VkImageView full;               // a view of the whole image as created
     VkBufferView tbuf;              // buffer textures: a texel buffer view of the pool
     uint64_t last_use;              // submission fence of the last use
@@ -121,6 +123,12 @@ struct vkimg {
     struct vkimg *ovl[8]; int novl;   // the other images over some of the same memory (a texture of another description over it: on the Switch it sees these texels)
     uint64_t wseq, rseen;             // when it was last rendered to (gfx_vk_tex.c g_wseq); the newest overlapping write already reported
 };
+// Render scale (prototype, DM_VK_RES_SCALE): an image's size in texels and its factor (1 when not scaled). Vulkan's extents, regions, viewports and scissors use
+// these; the game's own sizes and coordinates stay w, h
+static inline uint32_t img_pw(const vkimg_t *im) { return im->pw ? im->pw : im->w; }
+static inline uint32_t img_ph(const vkimg_t *im) { return im->ph ? im->ph : im->h; }
+static inline float img_rs(const vkimg_t *im) { return im->rs > 0 ? im->rs : 1.0f; }
+float vk_res_scale(void);   // gfx_vk_tex.c: the factor asked for (DM_VK_RES_SCALE), 1 = off
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)
 int vk_window_bottom_up(void);                                   // the game draws in lower-left origin mode: its window image is stored bottom-up (gfx_vk_exec.c)

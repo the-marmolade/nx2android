@@ -1288,7 +1288,7 @@ static int pp_draw(VkCommandBuffer cb, uint32_t k, vkimg_t *im, VkImage tgt, VkI
     if ((!aa && !scale) || !V.has_dynrender || !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || im->layers > 1 || !im->w || !im->h || cw <= 0 || ch <= 0) return 0;
     VkImageViewCreateInfo vc = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im->img, VK_IMAGE_VIEW_TYPE_2D, im->fmt, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (vkCreateImageView(V.dev, &vc, NULL, &g_aa_view[k])) { g_aa_view[k] = VK_NULL_HANDLE; VKRED_ONCE(114, "picture passes: no view of the picture (format %d): blitted", im->fmt); return 0; }
-    pp_src s = {g_aa_view[k], im->w, im->h, cx, cy, cw, ch, vk_window_bottom_up(), fmt_srgb(im->fmt)};
+    pp_src s = {g_aa_view[k], img_pw(im), img_ph(im), cx, cy, cw, ch, vk_window_bottom_up(), fmt_srgb(im->fmt)};
     pp_dst screen = {tgt, tview, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, g_sext, dx, dy, dw, dh};
     if (scale && !up_setup()) scale = 0;
     if (!scale) return aa == 1 ? fxaa_run(cb, k, &s, &screen) : aa == 2 ? smaa_run(cb, k, &s, &screen) : 0;
@@ -1321,6 +1321,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     int fx = 0;   // the picture went through the picture passes (pp_draw: anti-aliasing, upscaling): tgt is then in COLOR_ATTACHMENT
     if (im) {
     int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
+    { float rs = img_rs(im); if (rs != 1) { cx = (int)lroundf(cx * rs); cy = (int)lroundf(cy * rs); cw = (int)lroundf(cw * rs); ch = (int)lroundf(ch * rs); } }   // (render scale: the game's crop in the image's own texels)
     double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;
     vk_pic_set((float)dx / g_sext.width, (float)dy / g_sext.height, (float)dw / g_sext.width, (float)dh / g_sext.height);
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
@@ -1398,7 +1399,7 @@ static int shot_wanted(uint64_t n) {
 }
 static void shot(vkimg_t *im, uint64_t n) {
     void mtl_sub_begin(void); uint64_t mtl_sub_commit(void); int mtl_wait(uint64_t, uint64_t);
-    uint32_t w = im->w, h = im->h; VkBuffer sb; VkDeviceSize so;
+    uint32_t w = img_pw(im), h = img_ph(im); VkBuffer sb; VkDeviceSize so;   // (render scale: the whole image)
     mtl_sub_begin();
     uint8_t *p = vk_scratch((VkDeviceSize)w * h * 4, 16, &sb, &so);
     VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
