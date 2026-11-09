@@ -396,7 +396,7 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
                                               "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Shader prewarm", "Record 60 s", "Heavy mode", "MT replay",
-                                              "Battery saver", "Anti-aliasing", "Upscaling", "Face buttons", "Resume", ""};
+                                              "Battery saver", "Anti-aliasing", "Upscaling", "Resolution", "Face buttons", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
@@ -454,6 +454,10 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             int m = it == OVM_AA ? dm_aa_mode() : dm_upscale_mode(), vs = is; char v[24]; snprintf(v, sizeof v, "< %s >", (it == OVM_AA ? AA : UP)[m < 0 || m > 2 ? 0 : m]);
             while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
             cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, m ? C_ACCENT : C_WHITE);
+        } else if (it == OVM_RES) {   // Resolution: Native, 1440p, 4K (from the next launch: front_android.c dm_res_value)
+            char v[48]; int acc = dm_res_value(v, sizeof v), vs = is;
+            while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
+            cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, acc ? C_ACCENT : C_WHITE);
         } else if (it == OVM_FCAP) {   // the frame rate: Auto or the held rate
             int c = OVM_FCAPS[st >> 25 & 3], vs = is; char v[24]; if (c) snprintf(v, sizeof v, "< %d fps >", c); else snprintf(v, sizeof v, "< Auto >");
             while (vs > 1 && cv_text_w(v, vs) > rw - cv_text_w(OVM_LABELS[it], is) - gap - rh * 0.3f) vs--;
@@ -1026,6 +1030,7 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
 #include "smaa/SearchTex.h"
 __attribute__((weak)) int dm_aa_mode(void) { return 0; }
 __attribute__((weak)) int dm_upscale_mode(void) { return 0; }
+__attribute__((weak)) void dm_res_seen(uint32_t w, uint32_t h) { (void)w; (void)h; }   // (front_android.c: the Resolution setting)
 void dm_fsr_easu_con(uint32_t con[16], float vw, float vh, float iw, float ih, float ow, float oh, float ox, float oy);   // fsr_con.c
 void dm_fsr_rcas_con(uint32_t con[4], float sharpness);
 typedef struct { VkImageView view; uint32_t w, h; int cx, cy, cw, ch, flip, srgb; } pp_src;   // a picture to read: its size, the rectangle read, stored bottom-up
@@ -1320,6 +1325,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     vkCmdClearColorImage(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
     int fx = 0;   // the picture went through the picture passes (pp_draw: anti-aliasing, upscaling): tgt is then in COLOR_ATTACHMENT
     if (im) {
+    dm_res_seen(im->w, im->h);   // (the game's picture size, the Resolution setting's base: front_android.c)
     int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
     { float rs = img_rs(im); if (rs != 1) { cx = (int)lroundf(cx * rs); cy = (int)lroundf(cy * rs); cw = (int)lroundf(cw * rs); ch = (int)lroundf(ch * rs); } }   // (render scale: the game's crop in the image's own texels)
     double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;

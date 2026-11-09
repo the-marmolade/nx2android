@@ -89,6 +89,31 @@ static _Atomic int g_set_aa;   // the Graphics tab: Anti-aliasing (0 off, 1 FXAA
 int dm_aa_mode(void) { return atomic_load(&g_set_aa); }
 static _Atomic int g_set_up;   // the Graphics tab: Upscaling (0 bilinear, 1 FSR 1, 2 Snapdragon GSR 1; settings.txt upscale=), read by the present (gfx_vk_present.c pp_draw)
 int dm_upscale_mode(void) { return atomic_load(&g_set_up); }
+// The Graphics tab's Resolution (settings.txt resolution=): Native, 1440p, 4K (2160p), from the next launch. The game's full-size render targets are made that tall
+// (gfx_vk_tex.c res_scale_of: DM_VK_RES_SCALE, the height asked for over the game's; DM_VK_RES_BASE, the game's size): the game's size is the picture it presents,
+// learned per mode (docked, handheld: settings.txt resbase_d= / resbase_h=, dm_res_seen) and taken at the next start; before it was seen, 1920x1080 docked and
+// 1280x720 handheld. env.txt's DM_VK_RES_SCALE / DM_VK_RES_BASE win (tests). g_res_run: what this launch runs at
+static const int RES_H[3] = {0, 1440, 2160};
+static _Atomic int g_set_res; static int g_res_run; static _Atomic uint32_t g_res_base[2][2];   // [handheld, docked][w, h]
+void dm_res_seen(uint32_t w, uint32_t h);
+static void settings_save(void);
+static void *res_save_thread(void *a) { (void)a; settings_save(); return NULL; }
+int dm_opmode(void);   // hle_oe.c
+void dm_res_seen(uint32_t w, uint32_t h) {   // the present thread, each game picture: its size, kept for its mode once it has held 120 presents in a row (not a movie's)
+    static uint32_t cw, ch, n;
+    if (w != cw || h != ch) { cw = w; ch = h; n = 0; return; }
+    if (++n != 120 || w < 320 || h < 240 || w > 4096 || h > 4096) return;
+    int m = dm_opmode() != 0;
+    if (atomic_load(&g_res_base[m][0]) == w && atomic_load(&g_res_base[m][1]) == h) return;
+    atomic_store(&g_res_base[m][0], w); atomic_store(&g_res_base[m][1], h);
+    LOG("[menu] resolution: the game's %s picture is %ux%u (Resolution's scale from the next launch)", m ? "docked" : "handheld", w, h);
+    pthread_t t; if (!pthread_create(&t, NULL, res_save_thread, NULL)) pthread_detach(t);   // (no file writes on the present thread)
+}
+int dm_res_value(char *v, int cap) {   // gfx_vk_present.c: the row's value; 1 when shown in the accent colour (on, or changed for the next launch)
+    static const char *const N[3] = {"Native", "1440p", "4K"}; int s = atomic_load(&g_set_res) % 3;
+    snprintf(v, (size_t)cap, s != g_res_run ? "< %s > next launch" : "< %s >", N[s]);
+    return s != 0 || s != g_res_run;
+}
 void dm_perf_set_cap(int fps); void dm_perf_set_container(int on); void dm_perf_set_lowlat(int on);   // perf_android.c
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
@@ -109,6 +134,9 @@ static void settings_load(void) {
         else if (sscanf(line, "container=%d", &v) == 1) atomic_store(&g_set_cont, v != 0);
         else if (sscanf(line, "aa=%d", &v) == 1) atomic_store(&g_set_aa, v >= 0 && v <= 2 ? v : 0);
         else if (sscanf(line, "upscale=%d", &v) == 1) atomic_store(&g_set_up, v >= 0 && v <= 2 ? v : 0);
+        else if (sscanf(line, "resolution=%d", &v) == 1) atomic_store(&g_set_res, v >= 0 && v <= 2 ? v : 0);
+        else if (!strncmp(line, "resbase_", 8) && (line[8] == 'd' || line[8] == 'h')) { unsigned w, h; if (sscanf(line + 10, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 240 && w <= 4096 && h <= 4096) {
+            atomic_store(&g_res_base[line[8] == 'd'][0], w); atomic_store(&g_res_base[line[8] == 'd'][1], h); } }
         else if (sscanf(line, "lowlatency=%d", &v) == 1) atomic_store(&g_set_ll, v != 0);
         else if (sscanf(line, "heavy=%d", &v) == 1) atomic_store(&g_set_heavy, v < 0 ? -1 : v != 0);
         else if (sscanf(line, "mtreplay=%d", &v) == 1) atomic_store(&g_set_mtr, v < 0 ? -1 : v != 0);
@@ -129,7 +157,11 @@ static void settings_load(void) {
     }
     fclose(f);
 }
-static void settings_save(void) {
+static void settings_save_locked(void);
+static void settings_save(void) {   // (the menu's thread and dm_res_seen's: one at a time, the file written whole and renamed)
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu); settings_save_locked(); pthread_mutex_unlock(&mu);
+}
+static void settings_save_locked(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
@@ -139,6 +171,8 @@ static void settings_save(void) {
             atomic_load(&g_set_batt), g_batt_prev[0], g_batt_prev[1], g_batt_prev[2]);
     fprintf(f, "fpscap=%d\ncontainer=%d\nlowlatency=%d\naa=%d\nupscale=%d\n", OVM_FCAPS[atomic_load(&g_set_fcap) & 3], atomic_load(&g_set_cont), atomic_load(&g_set_ll),
             atomic_load(&g_set_aa), atomic_load(&g_set_up));
+    fprintf(f, "resolution=%d\n", atomic_load(&g_set_res));
+    for (int m = 0; m < 2; m++) if (atomic_load(&g_res_base[m][0])) fprintf(f, "resbase_%c=%ux%u\n", m ? 'd' : 'h', atomic_load(&g_res_base[m][0]), atomic_load(&g_res_base[m][1]));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
@@ -632,6 +666,8 @@ static void menu_do(int item) {
     else if (item == OVM_AA) { int m = (atomic_load(&g_set_aa) + 1) % 3; atomic_store(&g_set_aa, m); atomic_fetch_add(&g_set_ver, 1); settings_save(); LOG("[menu] anti-aliasing %s", m == 2 ? "SMAA" : m ? "FXAA" : "off"); }   // Off, FXAA, SMAA
     else if (item == OVM_UP) { int m = (atomic_load(&g_set_up) + 1) % 3; atomic_store(&g_set_up, m); atomic_fetch_add(&g_set_ver, 1); settings_save();
                                LOG("[menu] upscaling %s", m == 2 ? "Snapdragon GSR 1" : m ? "FSR 1" : "bilinear"); }   // Bilinear, FSR 1, GSR
+    else if (item == OVM_RES) { int m = (atomic_load(&g_set_res) + 1) % 3; atomic_store(&g_set_res, m); atomic_fetch_add(&g_set_ver, 1); settings_save();
+                                LOG("[menu] resolution %s from the next launch", m == 2 ? "4K" : m ? "1440p" : "native"); }   // Native, 1440p, 4K
     else if (item == OVM_DRUN) return;   // (a note: the driver this launch runs on)
     else if (item == OVM_DQUIT) { dm_haptics_android_tap(); driver_quit(); return; }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
@@ -1329,6 +1365,13 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
     settings_load(); { char pw[4]; snprintf(pw, sizeof pw, "%d", atomic_load(&g_set_prewarm)); setenv("DM_VK_PREWARM", pw, 0); }   // (env.txt's wins: tests)
+    { int s = atomic_load(&g_set_res) % 3; const char *om = getenv("DM_OPMODE"); int docked = om ? atoi(om) != 0 : 1;   // Resolution: this launch's (env.txt's DM_VK_RES_* win)
+      uint32_t bw = atomic_load(&g_res_base[docked][0]), bh = atomic_load(&g_res_base[docked][1]); if (!bw) { bw = docked ? 1920 : 1280; bh = docked ? 1080 : 720; }
+      if (s && !getenv("DM_VK_RES_SCALE")) { char sc[16], base[24]; snprintf(sc, sizeof sc, "%.4f", (double)RES_H[s] / bh); snprintf(base, sizeof base, "%ux%u", bw, bh);
+          setenv("DM_VK_RES_SCALE", sc, 1); setenv("DM_VK_RES_BASE", base, 0);
+          LOG("[menu] resolution %s: the game's %s targets (%s%s) made %.4f times as large", s == 2 ? "4K" : "1440p", docked ? "docked" : "handheld", base,
+              atomic_load(&g_res_base[docked][0]) ? "" : ", not yet seen: the usual size", (double)RES_H[s] / bh); }
+      g_res_run = s; }
     { int h = atomic_load(&g_set_heavy), m = atomic_load(&g_set_mtr);   // Tools: the next launch's choices, over env.txt's
       if (h >= 0) { setenv("DM_NVN_ASYNC", h ? "1" : "0", 1); if (h) setenv("DM_PIN_REPLAY", "prime", 0); }
       if (m >= 0) setenv("DM_VK_MT_REPLAY", m ? "1" : "0", 1);

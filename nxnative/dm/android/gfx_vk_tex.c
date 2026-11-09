@@ -169,7 +169,7 @@ static VkFormat srgb_twin(VkFormat f) {
 // Graveyard Keeper 2, Advance Wars and DKCR drew the same pictures. A colour view in another format than the image's and its twin is logged [RED] (vk_tex_view):
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
-// ---- render scale, prototype (DM_VK_RES_SCALE=1.3333 for 1440p from 1080p, 2 for 2160p; start-up): the game's full-size render targets are made larger and
+// ---- render scale (the Graphics tab's Resolution, front_android.c, or env.txt's DM_VK_RES_SCALE=1.3333 for 1440p from 1080p, 2 for 2160p; start-up): the game's full-size render targets are made larger and
 // drawn at that size, their viewports, scissors and copies scaled (gfx_vk_exec.c), the present reads them whole (gfx_vk_present.c). Full size: DM_VK_RES_BASE
 // (WxH, 1920x1080 by default: a docked game's). Scaled: a 2D colour or depth target (or 2D array: Mario Kart 8 Deluxe draws its glow and particles into two layers of one, with its scaled depth; or multisample) of exactly that size, one level, not
 // block-compressed, not linear (the CPU reads linear ones). Not done: shaders that read texels by their position (texelFetch, image loads), or that work out
@@ -177,7 +177,7 @@ static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = get
 float vk_res_scale(void) {
     static float s = -1;
     if (s < 0) { const char *e = getenv("DM_VK_RES_SCALE"); s = e ? strtof(e, NULL) : 1.0f; if (!(s > 1.01f && s <= 3.0f)) s = 1.0f;
-                 if (s > 1) VKLOG("[vk] render scale %.4f (DM_VK_RES_SCALE, prototype)", s); }
+                 if (s > 1) VKLOG("[vk] render scale %.4f (the Graphics tab's Resolution, front_android.c; or env.txt's DM_VK_RES_SCALE)", s); }
     return s;
 }
 static float res_scale_of(const nvn_texdesc *d, const vkfmt_t *f, VkImageUsageFlags u) {
