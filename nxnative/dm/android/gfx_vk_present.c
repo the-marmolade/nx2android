@@ -667,15 +667,19 @@ static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, co
     }
 }
 extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all submissions
+void dm_shader_stats(uint64_t *stall_n, uint64_t *stall_ns, uint64_t *bg_n);   // gfx_vk_exec.c: shader misses so far
 int dm_perf_container(void);   // perf_android.c: the 120 Hz container (the HUD's green limit)
 static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     static uint64_t n0, nl; static int64_t t0, tl; static int fps = -1;
     static uint64_t g0; static float gms = -1, gpct = -1;
+    // shader misses (gfx_vk_exec.c dm_shader_stats) in the last second, as two half-second windows: the frame's own builds (count, ms) and the background's
+    static uint64_t s0[3]; static uint64_t sw[2][3]; uint64_t sn[3]; dm_shader_stats(&sn[0], &sn[1], &sn[2]);
     long busy = -1, mhz = -1; if (level > 1) { kgsl_ask(now); busy = atomic_load(&g_kgsl_busy); mhz = atomic_load(&g_kgsl_mhz); }   // (kgsl_thread's latest)
     uint64_t n = atomic_load(&g_fps_frames);
-    if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; g0 = g_gpu_ns; gms = gpct = -1; g_ft_n = 0; }   // the first frame, or after a pause in the presents: measure anew
+    if (!t0 || now - t0 > 2000000000ll) { t0 = now; n0 = n; fps = -1; g0 = g_gpu_ns; gms = gpct = -1; g_ft_n = 0; memcpy(s0, sn, sizeof s0); memset(sw, 0, sizeof sw); }   // the first frame, or after a pause in the presents: measure anew
     else if (now - t0 >= 500000000ll) {
         double dt = (double)(now - t0); uint64_t g = g_gpu_ns;
+        memcpy(sw[0], sw[1], sizeof sw[0]); for (int i = 0; i < 3; i++) { sw[1][i] = sn[i] - s0[i]; s0[i] = sn[i]; }
         fps = (int)((double)(n - n0) * 1e9 / dt + 0.5);
         if (n > n0 && g >= g0) { gms = (float)((double)(g - g0) / (double)(n - n0) / 1e6); gpct = (float)((double)(g - g0) * 100 / dt); }
         t0 = now; n0 = n; g0 = g;
@@ -716,12 +720,14 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
       o = b >= 0 ? snprintf(l5, sizeof l5, "BAT %d%%", b) : snprintf(l5, sizeof l5, "BAT --");
       if (tb[0]) o += snprintf(l5 + o, sizeof l5 - (size_t)o, " %s", tb);   // "BAT 80% 38C" (red when the battery is hot)
       if (atomic_load(&g_hud_saver)) snprintf(l5 + o, sizeof l5 - (size_t)o, " LOW"); }
-    int nlines = ts[0] ? 6 : 5;
+    // "PSO 2 38ms BG 4": in the last second, pipelines the frame waited for (and its wait) and the ones built in the background (their draws left out meanwhile)
+    char lp[32]; snprintf(lp, sizeof lp, "PSO %llu %.0fms BG %llu", (unsigned long long)(sw[0][0] + sw[1][0]), (double)(sw[0][1] + sw[1][1]) / 1e6, (unsigned long long)(sw[0][2] + sw[1][2]));
+    int nlines = ts[0] ? 7 : 6;
     float gw = 18 * cw, gh = ch * 3, lh = ch + pad;
     ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + nlines * lh + 3 * pad + gh, 0.5f);
     ov_line(cb, x, m + pad, cw, ch, s, 0); ov_line(cb, x, m + pad + lh, cw, ch, l2, 0); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3, 0);
-    ov_line(cb, x, m + pad + 3 * lh, cw, ch, l4, 0); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l5, hb);
-    if (ts[0]) ov_line(cb, x, m + pad + 5 * lh, cw, ch, ts, hs);
+    ov_line(cb, x, m + pad + 3 * lh, cw, ch, lp, 0); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l4, 0); ov_line(cb, x, m + pad + 5 * lh, cw, ch, l5, hb);
+    if (ts[0]) ov_line(cb, x, m + pad + 6 * lh, cw, ch, ts, hs);
     // green up to: 5% over the period; with the 120 Hz container half a refresh over it (a frame handed over a little late still makes its refresh, and one that
     // misses shows a whole refresh longer: 25 ms for 60 fps at 120 Hz, amber)
     float ok_ms = period * 1.05f;

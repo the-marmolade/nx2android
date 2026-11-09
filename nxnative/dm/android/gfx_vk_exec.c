@@ -65,6 +65,11 @@ static int g_var_now;   // the bisection's change for the draw being recorded (s
 static int g_tracing;   // the draw being recorded is the one the bisection found (its descriptors are logged)
 // replay counters, printed by gfx_vk_present.c every 600 presents (draws done and skipped by reason, passes, clears folded into load ops, dispatches)
 struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; static uint64_t g_pass_draws;   // ns_*: time in the replay, its descriptor sets, its pipeline keys and lookups
+// Shader misses, for the HUD and the frame recordings (dm_shader_stats): pipelines the replay built in place (the frame waited: count and time) and the ones
+// sent to the background builders (their draws left out until made). Prewarm's builds are not misses
+static _Atomic uint64_t g_shd_stall_n, g_shd_stall_ns, g_shd_bg;
+static void shd_stall(uint64_t ns) { atomic_fetch_add(&g_shd_stall_n, 1); atomic_fetch_add(&g_shd_stall_ns, ns); }
+void dm_shader_stats(uint64_t *stall_n, uint64_t *stall_ns, uint64_t *bg_n) { *stall_n = atomic_load(&g_shd_stall_n); *stall_ns = atomic_load(&g_shd_stall_ns); *bg_n = atomic_load(&g_shd_bg); }
 static inline uint64_t tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 // The per-draw timers (about 10 a draw, ~3,000 draws a frame): the arm64 counter register read directly, a few ns against clock_gettime's ~20-40, in ns
 static inline uint64_t tick(void) {
@@ -905,7 +910,7 @@ static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); un
     if (!g_apq_on) { g_apq_on = 1; for (int i = 0; i < 2; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, async_pipe_thread, NULL); pthread_attr_destroy(&a); } }
     int ok = g_apq_h - g_apq_t < APQ; if (ok) { g_apq[g_apq_h % APQ] = *k; g_apq_h++; pthread_cond_signal(&g_apq_cv); }
     pthread_mutex_unlock(&g_apq_mu);
-    if (ok) { pthread_mutex_lock(&g_pipe_mu); if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, PIPE_PENDING); pthread_mutex_unlock(&g_pipe_mu); }
+    if (ok) { pthread_mutex_lock(&g_pipe_mu); if (!nvn_hm_get(&g_pipes, k)) nvn_hm_put(&g_pipes, k, PIPE_PENDING); pthread_mutex_unlock(&g_pipe_mu); atomic_fetch_add(&g_shd_bg, 1); }
     return ok;
 }
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
@@ -915,7 +920,8 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
     if (async_pipe(k)) return VK_NULL_HANDLE;
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
-    uint64_t tb = g_prof_on ? tick() : 0; p = build_pipeline(k, layout, stg); if (g_prof_on) g_prof_ns[0] += tick() - tb; g_vkst.pipes_built++;
+    uint64_t tb = tick(); p = build_pipeline(k, layout, stg); uint64_t tc = tick() - tb; if (g_prof_on) g_prof_ns[0] += tc; g_vkst.pipes_built++;
+    shd_stall(tc);
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
     if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
@@ -2087,7 +2093,8 @@ static void dispatch(const p_dispatch *d) {
     uint64_t ck[3] = {cs->key, g_num_um, g_num_im};
     pthread_mutex_lock(&g_cpipe_mu); VkPipeline p = nvn_hm_get(&g_cpipes, ck); pthread_mutex_unlock(&g_cpipe_mu);
     if (!p) {
-        uint64_t tb = g_prof_on ? tick() : 0; p = compute_build(cs, ck[1], ck[2]); if (g_prof_on) g_prof_ns[7] += tick() - tb;
+        uint64_t tb = tick(); p = compute_build(cs, ck[1], ck[2]); uint64_t tc = tick() - tb; if (g_prof_on) g_prof_ns[7] += tc;
+        shd_stall(tc);
         pthread_mutex_lock(&g_cpipe_mu); VkPipeline had = nvn_hm_get(&g_cpipes, ck);
         if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; } else nvn_hm_put(&g_cpipes, ck, p);   // (compute_warm made it meanwhile)
         pthread_mutex_unlock(&g_cpipe_mu);

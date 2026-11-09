@@ -334,7 +334,8 @@ void dm_perf_sample(dm_sample *s) {
 }
 // ---- the frame recording (the pause menu's Tools tab, Record 60 s): each frame's times as a row of perf-<date>-<time>.csv in the files folder (porter install pulls
 // them to the PC), with the device's readings every half second. The present thread only puts the row in a ring; a thread of its own writes the file
-typedef struct { int64_t t, iv, work, pq, gpu, target; } rec_row;
+typedef struct { int64_t t, iv, work, pq, gpu, target; uint64_t shd[3]; } rec_row;   // shd: dm_shader_stats so far (the writer takes each row's change)
+__attribute__((weak)) void dm_shader_stats(uint64_t *stall_n, uint64_t *stall_ns, uint64_t *bg_n) { *stall_n = *stall_ns = *bg_n = 0; }   // (gfx_vk_exec.c; the null device has none)
 #define REC_N 4096
 static rec_row g_rec[REC_N]; static _Atomic unsigned g_rec_w, g_rec_ver; static unsigned g_rec_r; static _Atomic int g_rec_st;   // 0 none yet, 1 recording, 2 saved, 3 failed
 static int64_t g_rec_t0, g_rec_until; static char g_rec_name[48];
@@ -346,15 +347,19 @@ static void *rec_thread(void *arg) {
     strftime(g_rec_name, sizeof g_rec_name, "perf-%Y%m%d-%H%M%S.csv", &tm);
     char path[600]; snprintf(path, sizeof path, "%s/%s", root ? root : ".", g_rec_name); FILE *f = fopen(path, "w");
     if (!f) { LOG("[RED] [perf] recording: cannot write %s", path); atomic_store(&g_rec_st, 3); atomic_fetch_add(&g_rec_ver, 1); return NULL; }
-    fprintf(f, "time_ms,frame_ms,work_ms,present_wait_ms,gpu_ms,target_ms,cpu_prime_mhz,gpu_mhz,gpu_busy_pct,thermal,battery_pct,battery_saver\n");
-    dm_sample s; dm_perf_sample(&s); int64_t next = perf_now() + 500000000; unsigned rows = 0;
+    // (the shader columns last, so the earlier ones keep their places: pipelines the frame waited for, that wait, and the ones sent to the background builders)
+    fprintf(f, "time_ms,frame_ms,work_ms,present_wait_ms,gpu_ms,target_ms,cpu_prime_mhz,gpu_mhz,gpu_busy_pct,thermal,battery_pct,battery_saver,pso_stalls,pso_stall_ms,pso_background\n");
+    dm_sample s; dm_perf_sample(&s); int64_t next = perf_now() + 500000000; unsigned rows = 0; uint64_t sp[3] = {0}; int have_sp = 0;
     for (;;) {
         struct timespec ts = {0, 100000000}; nanosleep(&ts, NULL);
         int64_t now = perf_now(); if (now >= next) { dm_perf_sample(&s); next = now + 500000000; }
         unsigned w = atomic_load(&g_rec_w);
         for (; g_rec_r != w; g_rec_r++, rows++) { const rec_row *r = &g_rec[g_rec_r % REC_N];
-            fprintf(f, "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%ld,%ld,%ld,%d,%d,%d\n", (r->t - g_rec_t0) / 1e6, r->iv / 1e6, r->work / 1e6, r->pq / 1e6, r->gpu / 1e6, r->target / 1e6,
-                    s.cpu_mhz, s.gpu_mhz, s.gpu_busy, s.thermal, s.battery, s.saver); }
+            if (!have_sp) { memcpy(sp, r->shd, sizeof sp); have_sp = 1; }
+            fprintf(f, "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%ld,%ld,%ld,%d,%d,%d,%llu,%.3f,%llu\n", (r->t - g_rec_t0) / 1e6, r->iv / 1e6, r->work / 1e6, r->pq / 1e6, r->gpu / 1e6, r->target / 1e6,
+                    s.cpu_mhz, s.gpu_mhz, s.gpu_busy, s.thermal, s.battery, s.saver,
+                    (unsigned long long)(r->shd[0] - sp[0]), (double)(r->shd[1] - sp[1]) / 1e6, (unsigned long long)(r->shd[2] - sp[2]));
+            memcpy(sp, r->shd, sizeof sp); }
         if (now >= g_rec_until) break;
     }
     fclose(f); atomic_store(&g_rec_st, 2); atomic_fetch_add(&g_rec_ver, 1);
@@ -370,7 +375,8 @@ void dm_perf_record_start(int seconds) {
 }
 static void rec_push(int64_t t, int64_t iv, int64_t work, int64_t pq, int64_t target) {   // (the present thread)
     unsigned w = atomic_load(&g_rec_w); if (w - g_rec_r >= REC_N) return;   // the writer behind: the row dropped
-    g_rec[w % REC_N] = (rec_row){t, iv, work, pq, g_frame_gpu, target}; atomic_store(&g_rec_w, w + 1);
+    rec_row *r = &g_rec[w % REC_N]; *r = (rec_row){t, iv, work, pq, g_frame_gpu, target, {0}}; dm_shader_stats(&r->shd[0], &r->shd[1], &r->shd[2]);
+    atomic_store(&g_rec_w, w + 1);
 }
 void dm_perf_frame(double period) {
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();

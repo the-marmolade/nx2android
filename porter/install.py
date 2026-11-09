@@ -9,7 +9,7 @@ import hashlib, posixpath, re, shlex, tempfile, zipfile
 from pathlib import Path
 
 from porter import datapack
-PIPELINES = 'vk_pipelines.bin'; PIPE_MAGIC = b'PPE1'   # (gfx_vk_exec.c PIPE_MAGIC 0x31455050, little-endian)
+PIPELINES = 'vk_pipelines.bin'; PIPE_MAGIC = b'PPE'   # (gfx_vk_exec.c PIPE_MAGIC: "PPE" and a layout digit, then the record size, both 32-bit little-endian)
 from porter.adb import Adb, AdbError, long_path
 from porter.upstream import BuildError, PROG, say
 
@@ -88,18 +88,39 @@ def apk_asks_access(apk):   # whether the APK asks for All files access: one mad
     return ACCESS.encode('utf-16-le') in m or ACCESS.encode() in m
 
 
+def pipe_records(data):
+    """(header, [records]) of a shader list (gfx_vk_exec.c: an 8-byte header, magic and record size, then fixed-size records; a torn last record dropped), or None"""
+    if len(data) < 8 or data[:3] != PIPE_MAGIC: return None
+    size = int.from_bytes(data[4:8], 'little')
+    if not 0 < size <= 1 << 16: return None
+    return data[:8], [data[8 + i * size: 8 + (i + 1) * size] for i in range((len(data) - 8) // size)]
+
+
+def merge_pipelines(mine, got):
+    """The PC's list and the device's as one: the PC's records, then the device's it lacks (a session that reached other scenes adds them, none is lost). A device list
+    of another layout (another host build: another header) replaces the PC's, whose records that host could not read. None: nothing to save"""
+    g = pipe_records(got)
+    if not g or not g[1]: return None
+    m = pipe_records(mine) if mine else None
+    if not m or m[0] != g[0]: return g[0] + b''.join(g[1])
+    have = set(m[1]); new = [r for r in dict.fromkeys(g[1]) if r not in have]
+    return m[0] + b''.join(m[1]) + b''.join(new) if new else None
+
+
 def harvest_pipelines(adb, files, dest):
-    """The pipeline list an earlier install recorded on the device (gfx_vk_exec.c: vk_pipelines.bin) into dest beside the data pack, when it is longer than the
-    one there: the next port packs it as the seed list (datapack SEED_PIPELINES), and that install's first launch, a fresh install or another driver starts warm"""
+    """The pipeline list an earlier install recorded on the device (gfx_vk_exec.c: vk_pipelines.bin) merged into the one beside the data pack (merge_pipelines):
+    the next port packs it as the seed list (datapack SEED_PIPELINES), and that install's first launch, a fresh install or another driver starts warm"""
     with tempfile.TemporaryDirectory() as t:
         got = Path(t) / PIPELINES
         try: adb.run('pull', f'{files}/{PIPELINES}', str(got), check=False, retries=1)
         except AdbError: return
-        if not got.is_file() or got.stat().st_size <= 8 or got.read_bytes()[:4] != PIPE_MAGIC: return
-        mine = Path(dest) / PIPELINES
-        if mine.is_file() and mine.stat().st_size >= got.stat().st_size: return
-        Path(dest).mkdir(parents=True, exist_ok=True); mine.write_bytes(got.read_bytes())
-        say(f'shader list: {got.stat().st_size // 1024} KB from the device saved to {mine} (the next port packs it, so its first launch starts warm)')
+        if not got.is_file(): return
+        mine = Path(dest) / PIPELINES; old = mine.read_bytes() if mine.is_file() else b''
+        out = merge_pipelines(old, got.read_bytes())
+        if out is None: return
+        o = pipe_records(old); before = len(o[1]) if o and o[0] == out[:8] else 0; after = len(pipe_records(out)[1])
+        Path(dest).mkdir(parents=True, exist_ok=True); tmp = mine.with_name(PIPELINES + '.tmp'); tmp.write_bytes(out); tmp.replace(mine)
+        say(f'shader list: {after - before} new pipelines from the device, {after} in {mine} (the next port packs it, so its first launch starts warm)')
 
 
 def install(apk, data, adb_exe, serial=None, replace_signer=False, romfs_at=None, romfs_push=False):
