@@ -25,6 +25,7 @@ static struct { uint64_t ticket, ns; } g_pres_t[PRES_TIMES];
 static struct { uint32_t id; uint64_t ticket; } g_pres_ids[PRES_TIMES];
 static pthread_mutex_t g_pres_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pres_recorded;   // display times recorded so far (present_time_record): none after 240 presents with display timing on, the hand-over time stands in
+static void ov_ft_disp(uint64_t ns);   // (the HUD's graph, below): a game frame's time on screen
 static void present_time_begin(uint64_t ticket, uint64_t ns) {   // ns: the time to report now (no display times on this device), or 0 for the display's
     pthread_mutex_lock(&g_pres_mu);
     g_pres_t[ticket % PRES_TIMES] = (typeof(g_pres_t[0])){ticket, ns};
@@ -40,6 +41,7 @@ static void present_time_record(uint32_t id, uint64_t ns) {   // the present thr
     typeof(g_pres_t[0]) *p = &g_pres_t[m->ticket % PRES_TIMES];
     if (p->ticket == m->ticket) p->ns = ns;
     pthread_mutex_unlock(&g_pres_mu); g_pres_recorded++;
+    ov_ft_disp(ns);
 }
 static void present_time_reset(void) {   // the old swapchain's pending results cannot describe the new one
     memset(g_pres_ids, 0, sizeof g_pres_ids);
@@ -635,6 +637,15 @@ static void ov_frame(VkCommandBuffer cb, int sp, const float b[4], float t, floa
 #define OV_FT_N 120
 static float g_ft[OV_FT_N]; static int g_ft_i, g_ft_n;   // frame times, ms (a ring)
 static void ov_ft_push(float ms) { g_ft[g_ft_i] = ms; g_ft_i = (g_ft_i + 1) % OV_FT_N; if (g_ft_n < OV_FT_N) g_ft_n++; }
+// With display timing the graph shows each game frame's time on screen, from the display's own present times (present_time_record, the present thread as the HUD):
+// the hand-over times wobble a few ms around the period with no frame shown late (Mario Kart 8 Deluxe on the AYN Thor at 60 Hz: 5% of hand-overs over 17.5 ms,
+// amber, and 0 of 5,400 frames shown late). A frame the display never showed counts in the next one's time. Without display times the hand-over stands in (ov_fps)
+static int g_ft_disp;
+static void ov_ft_disp(uint64_t ns) {
+    static uint64_t last; g_ft_disp = 1;
+    if (last && ns > last && ns - last < 1000000000ull) ov_ft_push((float)((double)(ns - last) / 1e6));
+    if (ns > last) last = ns;
+}
 // KGSL's files are read on a thread of their own, twice a second while the HUD shows: a sysfs read can take milliseconds (the kernel samples the GPU), and made on the
 // present thread it held a frame's hand-over (one or two amber bars a second in a green graph). The thread idles when the HUD has not asked for a second, and ends for
 // good when the busy percentage cannot be read (the timestamps stand in)
@@ -686,7 +697,7 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
         if (n > n0 && g >= g0) { gms = (float)((double)(g - g0) / (double)(n - n0) / 1e6); gpct = (float)((double)(g - g0) * 100 / dt); }
         t0 = now; n0 = n; g0 = g;
     }
-    if (level > 1 && n != nl) {   // a frame (or a few) shown since the last present: each one's share of the time since
+    if (level > 1 && n != nl && !g_ft_disp) {   // (no display times: ov_ft_disp) a frame (or a few) shown since the last present: each one's share of the time since
         if (tl && n > nl && now - tl < 1000000000ll) { float ms = (float)((double)(now - tl) / (double)(n - nl) / 1e6); for (uint64_t k = nl; k < n && k - nl < 4; k++) ov_ft_push(ms); }
         tl = now; nl = n;
     }
