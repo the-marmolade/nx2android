@@ -15,6 +15,8 @@
 #include "overlay_frag.spv.h"
 #include "rot_vert.spv.h"
 #include "rot_frag.spv.h"
+#include "fxaa_vert.spv.h"
+#include "fxaa_frag.spv.h"
 
 __attribute__((weak)) ANativeWindow *dm_front_window(void) { return NULL; }
 __attribute__((weak)) int dm_external_active(void) { return 0; }
@@ -385,7 +387,7 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
                                               "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Shader prewarm", "Record 60 s", "Heavy mode", "MT replay",
-                                              "Battery saver", "Face buttons", "Resume", ""};
+                                              "Battery saver", "Anti-aliasing", "Face buttons", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
@@ -456,10 +458,11 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_rrect(cv, x0 + cur * segw, cy - hh / 2, x0 + (cur + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
             for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(seg[k], is)) / 2, cy, seg[k], is, k == cur ? C_WHITE : C_DIM);
         } else {   // a switch
-            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : it == OVM_LOWLAT ? 7 : 3) & 1; float sx0 = x1 - sw;
+            int on = it == OVM_AA ? dm_aa_mode() != 0 : st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : it == OVM_LOWLAT ? 7 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
             cv_disc(cv, on ? x1 - sh / 2 : sx0 + sh / 2, cy, sh / 2 - fmaxf(2, sh * 0.1f), on ? C_WHITE : C_KNOB_OFF);
-            const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : it == OVM_C120 ? "AUTO" : "ON";   // (the container: in use where it helps) cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
+            // (the container: in use where it helps; anti-aliasing: its kind)
+            const char *word = !on ? "OFF" : it == OVM_FPS && (st >> 28 & 1) ? "ALL" : it == OVM_C120 ? "AUTO" : it == OVM_AA ? "FXAA" : "ON"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
         }
     }
 }
@@ -998,6 +1001,85 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
     g_pace_target = t;
     return t - g_refresh_ns / 2;
 }
+// ---- anti-aliasing (the pause menu's Graphics tab, front_android.c dm_aa_mode): the game's picture drawn onto the screen through FXAA (shaders/fxaa.*)
+// instead of the blit, with the same rectangles and the same linear scaling. Only with dynamic rendering and a picture the shader can sample; otherwise
+// the blit. A view of the picture per present slot (k): made at each present, destroyed when the slot comes round again (its fence waited)
+__attribute__((weak)) int dm_aa_mode(void) { return 0; }
+static struct { VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set[8]; VkImageView view[8]; VkSampler samp;
+                VkPipeline pipe; VkFormat pfmt; int bad; } g_fx;
+static int fxaa_setup(void) {
+    if (g_fx.bad) return 0;
+    if (!g_fx.dsl) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b};
+        VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8 * sizeof(float)};
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8}; VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 8, 1, &ps};
+        VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        VkResult r = vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_fx.dsl);
+        VkPipelineLayoutCreateInfo pl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &g_fx.dsl, 1, &pr};
+        if (!r) r = vkCreatePipelineLayout(V.dev, &pl, NULL, &g_fx.layout);
+        if (!r) r = vkCreateDescriptorPool(V.dev, &pi, NULL, &g_fx.pool);
+        VkDescriptorSetLayout ls[8]; for (int i = 0; i < 8; i++) ls[i] = g_fx.dsl;
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, g_fx.pool, 8, ls};
+        if (!r) r = vkAllocateDescriptorSets(V.dev, &ai, g_fx.set);
+        if (!r) r = vkCreateSampler(V.dev, &si, NULL, &g_fx.samp);
+        if (r) { g_fx.bad = 1; VKRED_ONCE(112, "anti-aliasing: descriptor sets, layout or sampler: %d; the picture is blitted", r); return 0; }
+    }
+    if (g_fx.pfmt != g_sfmt) {
+        if (g_fx.pipe) { vkDestroyPipeline(V.dev, g_fx.pipe, NULL); g_fx.pipe = VK_NULL_HANDLE; }
+        VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo vc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof fxaa_vert_spv, fxaa_vert_spv};
+        VkShaderModuleCreateInfo fc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof fxaa_frag_spv, fxaa_frag_spv};
+        VkResult r = vkCreateShaderModule(V.dev, &vc, NULL, &vm); if (!r) r = vkCreateShaderModule(V.dev, &fc, NULL, &fm);
+        VkPipelineShaderStageCreateInfo ss[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vm, "main", NULL},
+                                                {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fm, "main", NULL}};
+        VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0};
+        VkPipelineViewportStateCreateInfo vs = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+        VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, 0, 0, VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1};
+        VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT};
+        VkPipelineColorBlendAttachmentState ba = {0, 0, 0, 0, 0, 0, 0, 0xf};
+        VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba};
+        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR}; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 2, dyn};
+        VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
+        VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_fx.layout, VK_NULL_HANDLE};
+        if (!r) r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_fx.pipe);
+        if (vm) vkDestroyShaderModule(V.dev, vm, NULL); if (fm) vkDestroyShaderModule(V.dev, fm, NULL);
+        if (r) { g_fx.pipe = VK_NULL_HANDLE; g_fx.bad = 1; VKRED_ONCE(113, "anti-aliasing: pipeline for format %d: %d; the picture is blitted", g_sfmt, r); return 0; }
+        g_fx.pfmt = g_sfmt; VKLOG("[vk] anti-aliasing: FXAA ready (swapchain format %d)", g_sfmt);
+    }
+    return 1;
+}
+static int fmt_srgb(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32; }
+// The source rectangle (cx, cy, cw, ch of im) through FXAA into the destination rectangle (dx, dy, dw, dh of tgt, in TRANSFER_DST, left in COLOR_ATTACHMENT);
+// 1 when drawn, 0 when the caller blits instead (and tgt is untouched)
+static int fxaa_draw(VkCommandBuffer cb, uint32_t k, vkimg_t *im, VkImage tgt, VkImageView tview, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
+    if (g_fx.view[k]) { vkDestroyImageView(V.dev, g_fx.view[k], NULL); g_fx.view[k] = VK_NULL_HANDLE; }   // (slot k's fence was waited: its last present is done)
+    if (dm_aa_mode() != 1 || !V.has_dynrender || !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || im->layers > 1 || !im->w || !im->h || !fxaa_setup()) return 0;
+    VkImageViewCreateInfo vc = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im->img, VK_IMAGE_VIEW_TYPE_2D, im->fmt, {0, 0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (vkCreateImageView(V.dev, &vc, NULL, &g_fx.view[k])) { g_fx.view[k] = VK_NULL_HANDLE; VKRED_ONCE(114, "anti-aliasing: no view of the picture (format %d): blitted", im->fmt); return 0; }
+    VkDescriptorImageInfo ii = {g_fx.samp, g_fx.view[k], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_fx.set[k], 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii, NULL, NULL};
+    vkUpdateDescriptorSets(V.dev, 1, &w, 0, NULL);
+    barrier(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, tview, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, {{0, 0}, g_sext}, 1, 0, 1, &ca, NULL, NULL};
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fx.pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fx.layout, 0, 1, &g_fx.set[k], 0, NULL);
+    VkViewport vp = {(float)dx, (float)dy, (float)dw, (float)dh, 0, 1}; VkRect2D sc = {{dx, dy}, {(uint32_t)dw, (uint32_t)dh}};
+    vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
+    float W = (float)im->w, H = (float)im->h;
+    float pc[8] = {cx / W, cy / H, cw / W, ch / H, 1.0f / W, 1.0f / H, (float)fmt_srgb(im->fmt), 0};
+    if (vk_window_bottom_up()) { pc[1] = (cy + ch) / H; pc[3] = -pc[3]; }   // lower-left origin: the picture is stored bottom-up (as the blit's flipped source)
+    vkCmdPushConstants(cb, g_fx.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    { static int said; if (!said) { said = 1; VKLOG("[vk] anti-aliasing: FXAA on the picture (%ux%u, format %d) into %dx%d", im->w, im->h, im->fmt, dw, dh); } }
+    return 1;
+}
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
@@ -1015,6 +1097,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     barrier(cb, tgt, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cb, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
+    int fx = 0;   // the picture went through FXAA (fxaa_draw): tgt is then in COLOR_ATTACHMENT
     if (im) {
     int cx = crop ? crop[0] : 0, cy = crop ? crop[1] : 0, cw = crop && crop[2] ? crop[2] : (int)im->w, ch = crop && crop[3] ? crop[3] : (int)im->h;
     double s = fmin((double)g_sext.width / cw, (double)g_sext.height / ch); int dw = (int)(cw * s), dh = (int)(ch * s), dx = ((int)g_sext.width - dw) / 2, dy = ((int)g_sext.height - dh) / 2;
@@ -1022,9 +1105,10 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
     if (vk_window_bottom_up()) { b.srcOffsets[0].y = cy + ch; b.srcOffsets[1].y = cy; }   // lower-left origin: the window image is stored bottom-up (gfx_vk_exec.c)
     if (im->layout == VK_IMAGE_LAYOUT_UNDEFINED) { barrier(cb, im->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL); im->layout = VK_IMAGE_LAYOUT_GENERAL; }   // an imported frame buffer, first shown (gl_android.c)
-    vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    fx = fxaa_draw(cb, k, im, tgt, tview, cx, cy, cw, ch, dx, dy, dw, dh);
+    if (!fx) vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tgt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     }
-    VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    VkImageLayout lay = fx ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     int external = dm_external_active();
     int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps(), prog = dm_prewarm_progress(NULL, NULL);
     if (prog) { ovm = 0; menu = -1; fps = 0; }   // the prewarm's screen alone
