@@ -111,9 +111,9 @@ enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EX
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
             // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels)
 #define OVM_TABS 6   // the open tab in dm_menu_state: bit 8, bit 19 and bit 29 (low to high)
-// Graphics: Anti-aliasing (FXAA on the game's picture as it is put on the screen, gfx_vk_present.c fxaa_draw; at once). Its value is not in dm_menu_state (no bit
+// Graphics: Anti-aliasing (Off, FXAA or SMAA on the game's picture as it is put on the screen, gfx_vk_present.c fxaa_draw; at once). Its value is not in dm_menu_state (no bit
 // is left: 17 and 18 are the editor's and the save picker's marks): bit 23 turns over at each change, and the panel asks dm_aa_mode
-int dm_aa_mode(void);   // front_android.c: 0 off, 1 FXAA
+int dm_aa_mode(void);   // front_android.c: 0 off, 1 FXAA, 2 SMAA
 #define OVM_PER_TAB 5   // (-1: no row; OVM_ROWS stays under 8, the highlighted row's three bits)
 // Driver: the Vulkan driver for the next launch (the APK's DM_VK_DRIVERS and the system's), the one this launch runs on, and Quit, which the choice needs: a driver
 // is loaded once, before the game's first frame (gfx_vk_core.c vk_init). dm_menu_state bits 29..30: the chosen driver
