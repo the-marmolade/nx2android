@@ -670,6 +670,7 @@ extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all su
 void dm_shader_stats(uint64_t *stall_n, uint64_t *stall_ns, uint64_t *bg_n);   // gfx_vk_exec.c: shader misses so far
 int dm_perf_container(void);   // perf_android.c: the 120 Hz container in use (the HUD's green limit and its mode line)
 int dm_perf_lowlat_state(void);   // perf_android.c: low latency 0 off, 1 in use, 2 standing aside, 3 stopped for this launch
+double vk_refresh_ms(void);   // (below): the display's refresh from its timing, 0 unknown
 static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     static uint64_t n0, nl; static int64_t t0, tl; static int fps = -1;
     static uint64_t g0; static float gms = -1, gpct = -1;
@@ -727,8 +728,12 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     // (a frame needs over two periods), "LL STOP" stopped for this launch (frames kept missing their slots)
     char lm[24] = ""; { int ll = dm_perf_lowlat_state(), o = dm_perf_container() ? snprintf(lm, sizeof lm, "120Hz") : 0;
       if (ll) snprintf(lm + o, sizeof lm - (size_t)o, "%sLL%s", o ? " " : "", ll == 2 ? " PAUSE" : ll == 3 ? " STOP" : ""); }
-    const char *lines[8]; int hot[8] = {0}, nlines = 0;
+    const char *lines[10]; int hot[10] = {0}, nlines = 0;
     lines[nlines++] = s; if (lm[0]) lines[nlines++] = lm;
+    // The display's refresh, in red, when the game's frames are not a whole number of its refreshes (more than 0.05 ms off): a panel at 118.7 Hz (8.426 ms)
+    // shows a 60 fps game two refreshes a frame, 16.85 ms against 16.67, and about every 45 frames one is held a refresh longer (perf_android.c dm_perf_window)
+    char ld[24]; { double r = vk_refresh_ms(), q = r > 0 ? period / r : 0;
+      if (q >= 0.9 && fabs(q - round(q)) * r > 0.05) { snprintf(ld, sizeof ld, "DSP %.1fHz", 1000.0 / r); hot[nlines] = 1; lines[nlines++] = ld; } }
     lines[nlines++] = l2; lines[nlines++] = l3; lines[nlines++] = lp; lines[nlines++] = l4; hot[nlines] = hb; lines[nlines++] = l5;
     if (ts[0]) { hot[nlines] = hs; lines[nlines++] = ts; }
     float gw = 18 * cw, gh = ch * 3, lh = ch + pad;

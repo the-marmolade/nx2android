@@ -426,8 +426,17 @@ void dm_perf_frame(double period) {
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).
 void dm_perf_window(ANativeWindow *w, double fps) {
     if (!w || fps <= 0) return;
-    if (atomic_load(&g_container)) { const char *e = getenv("DM_DISPLAY_HZ"); double hz = e && atof(e) > 0 ? atof(e) : 120; fps = hz; }   // the container's rate
-    int r = ANativeWindow_setFrameRate(w, (float)fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
-    LOG("[perf] window frame rate %.0f fps%s", fps, r ? " refused" : "");
+    if (dm_perf_container()) { const char *e = getenv("DM_DISPLAY_HZ"); double hz = e && atof(e) > 0 ? atof(e) : 120; fps = hz; }   // the container's rate
+    // The display mode changes even when the change is not seamless (Android 12's ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS; looked up, the APK runs on 10):
+    // the default asks only for a seamless one, and the AYN Thor's panel stayed at 120 Hz for a 60 fps game, where its refresh is 8.426 ms as often as
+    // 8.333 (118.7 Hz): two refreshes are longer than the game's frame, and about 3 frames a second were held a refresh longer (Mario Kart 8 Deluxe,
+    // perf-20261109-212657). DM_DISPLAY_SWITCH=0: seamless changes only, as before
+    typedef int32_t (*set_rate_fn)(ANativeWindow *, float, int8_t, int8_t);
+    static set_rate_fn set_rate; static int looked;
+    if (!looked) { looked = 1; set_rate = (set_rate_fn)dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRateWithChangeStrategy"); }
+    const char *sw = getenv("DM_DISPLAY_SWITCH"); int always = set_rate && !(sw && !atoi(sw));
+    int r = always ? set_rate(w, (float)fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, 1 /* ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS */)
+                   : ANativeWindow_setFrameRate(w, (float)fps, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+    LOG("[perf] window frame rate %.0f fps%s%s", fps, always ? " (the display may change mode)" : "", r ? " refused" : "");
 }
 
