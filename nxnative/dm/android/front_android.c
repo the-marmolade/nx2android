@@ -162,7 +162,39 @@ static void on_pause(ANativeActivity *a) { (void)a; go_background(); }
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
-static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
+// Immersive full screen: the status bar and the navigation bar (with the gesture handle) hidden, a swipe from an edge shows them for a moment. AWINDOW_FLAG_FULLSCREEN
+// alone hides only the status bar: the gesture handle stayed over the game (AYN Thor). Android 11+: the window's WindowInsetsController, the bars shown
+// transiently by a swipe; Android 10: the IMMERSIVE_STICKY flags. On the main thread (onCreate and the focus callback): Android shows the bars again after a
+// dialog, the notification shade or another app, so each focus gain hides them again
+static int g_sdk;
+static void hide_system_bars(ANativeActivity *a) {
+    JNIEnv *E = a->env; jobject win = NULL, ctl = NULL;
+    jclass ac = (*E)->GetObjectClass(E, a->clazz); jmethodID gw = ac ? (*E)->GetMethodID(E, ac, "getWindow", "()Landroid/view/Window;") : NULL;
+    if (gw) win = (*E)->CallObjectMethod(E, a->clazz, gw);
+    if ((*E)->ExceptionCheck(E) || !win) { (*E)->ExceptionClear(E); LOG("[RED] full screen: no window"); return; }
+    jclass wc = (*E)->GetObjectClass(E, win);
+    if (g_sdk >= 30) {
+        jmethodID gic = (*E)->GetMethodID(E, wc, "getInsetsController", "()Landroid/view/WindowInsetsController;");
+        if (gic) ctl = (*E)->CallObjectMethod(E, win, gic);
+        jclass ty = (*E)->FindClass(E, "android/view/WindowInsets$Type"); jmethodID sb = ty ? (*E)->GetStaticMethodID(E, ty, "systemBars", "()I") : NULL;
+        if (!(*E)->ExceptionCheck(E) && ctl && sb) {
+            jint bars = (*E)->CallStaticIntMethod(E, ty, sb); jclass cc = (*E)->GetObjectClass(E, ctl);
+            jmethodID beh = (*E)->GetMethodID(E, cc, "setSystemBarsBehavior", "(I)V"), hide = (*E)->GetMethodID(E, cc, "hide", "(I)V");
+            if (beh) (*E)->CallVoidMethod(E, ctl, beh, 2);   // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            if (hide && !(*E)->ExceptionCheck(E)) (*E)->CallVoidMethod(E, ctl, hide, bars);
+            if (!(*E)->ExceptionCheck(E)) return;
+        }
+        (*E)->ExceptionClear(E); LOG("[RED] full screen: WindowInsetsController failed, the older flags instead");
+    }
+    jmethodID gd = (*E)->GetMethodID(E, wc, "getDecorView", "()Landroid/view/View;"); jobject dv = gd ? (*E)->CallObjectMethod(E, win, gd) : NULL;
+    if (!(*E)->ExceptionCheck(E) && dv) { jclass vc = (*E)->GetObjectClass(E, dv); jmethodID su = (*E)->GetMethodID(E, vc, "setSystemUiVisibility", "(I)V");
+        if (su) (*E)->CallVoidMethod(E, dv, su, 0x1706); }   // IMMERSIVE_STICKY | LAYOUT_FULLSCREEN | LAYOUT_HIDE_NAVIGATION | LAYOUT_STABLE | FULLSCREEN | HIDE_NAVIGATION
+    if ((*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] full screen: the system bars could not be hidden"); }
+}
+static void on_window_focus(ANativeActivity *a, int focused) {
+    if (focused) hide_system_bars(a);
+    if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2);
+}
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
 static int g_quit;
@@ -1267,6 +1299,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     act->callbacks->onInputQueueCreated = on_queue_created; act->callbacks->onInputQueueDestroyed = on_queue_destroyed;
     act->callbacks->onPause = on_pause; act->callbacks->onResume = on_resume; act->callbacks->onWindowFocusChanged = on_window_focus; act->callbacks->onDestroy = on_destroy;
     ANativeActivity_setWindowFlags(act, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
+    g_sdk = sdk; hide_system_bars(act);
     static int started; if (started++) return;   // a second onCreate (configuration change) keeps the running game
     snprintf(g_root, sizeof g_root, "%s", act->externalDataPath ? act->externalDataPath : act->internalDataPath);
     char p[700];
