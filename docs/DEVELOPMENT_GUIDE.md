@@ -41,6 +41,17 @@ python -m porter saves import "D:\Backups\Celeste\20261030-141200"
 
 How the export folders are laid out: [ARCHITECTURE.md](ARCHITECTURE.md#saves).
 
+### Vulkan driver
+
+`porter driver` changes the Vulkan driver of a port already on the device, without the game's files: the app's APK is rebuilt with the library and installed over it (the saves stay), and its `env.txt` names it. The app must have been ported with `--vulkan-driver` once (that build carries libadrenotools, which loads the driver):
+
+```
+python -m porter driver "D:\Drivers\libvulkan_freedreno.so" --package org.nx2a.supermario3dworld
+python -m porter driver --system --package org.nx2a.supermario3dworld
+```
+
+`--system` goes back to the device's own driver. How it works: [ARCHITECTURE.md](ARCHITECTURE.md#the-port).
+
 ## Layout
 
 - `porter/`: the port pipeline (`python -m porter`).
@@ -76,6 +87,15 @@ On Windows, `build_bootloader.py` compiles PyInstaller's launcher on this PC (it
 ```
 python -m unittest discover tests
 ```
+
+`test_dmsv` checks both shader-bundle versions and the native reader. Publication
+uses a unique staging directory beside the destination, flushes the file, verifies
+every shader and reflection payload, then atomically replaces the destination.
+Injected write, sync, readback and replacement failures leave the previous bundle
+intact and clean up staging; concurrent writers cannot overwrite each other's
+scratch files. The same contract applies to direct shader exports and CLI repacks.
+This protects completed file publication, not power-loss durability of the parent
+directory or semantic SPIR-V validation.
 
 `test_vk_copy_back` exercises protected guest memory with the real dirty-page tracker: preserving independent CPU writes in the same cache line, successive submissions and snapshot initialization, cached/uncached and untracked pools, 200 partial/unaligned/overlapping range cases, and writes from another CPU thread. It also injects failed and partially successful bulk `mprotect` calls; a bulk unprotect failure stops the host with a `[RED]` message before publishing writable page states or continuing the copy. It also checks snapshot copy volume across clean and dirty 64 KB blocks, a partial tail, and full versus partial completion merges. These CPU tests do not establish correct rendering on a device.
 

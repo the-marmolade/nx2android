@@ -219,7 +219,8 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
 // control drawn from it on each present; the procedural layer is then only the menu's panel, the dimming and the counter.
 enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_GREEN, SP_AMBER, SP_RED, SP_N };   // (black, white, accent: solid blocks, the dimming and the layout
                                                                                     //  editor's frames; green, amber, red: the performance HUD's frame-time bars)
-#define OV_FPS_CHARS "0123456789 FPS-GUms.%MHzADER/CTBLOW"   // (and the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
+#define OV_FPS_CHARS "0123456789 FPSCBATO-GUms.%MHzDER/LW"   // (the temperature rows: "SOC 52C", "BAT 38C"; the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
+#define OV_HOT_CHARS 19   // the first 19 (the temperature rows' characters) again in red after them: all 35 twice would not fit a 960-texel raster (1920 x 1080)
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
                 VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
                 VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov;
@@ -285,11 +286,11 @@ static void ov_box_ring(uint8_t *px, uint32_t w, uint32_t h, const ov_ctl *c, co
     }
 }
 static void ov_text(uint8_t *px, uint32_t w, uint32_t h, float cx, float cy, const char *s, int scale) {
-    int n = (int)strlen(s), x0 = (int)(cx - n * 6 * scale / 2.0f), y0 = (int)(cy - 7 * scale / 2.0f);
-    for (int i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i]; const unsigned char *g = FONT5X7[(c >= 32 && c < 127 ? c : 63) - 32];
+    int n = glyph_count(s), x0 = (int)(cx - n * 6 * scale / 2.0f), y0 = (int)(cy - 7 * scale / 2.0f);
+    for (int i = 0, cell = 0; s[i]; cell++) {
+        const unsigned char *g = glyph5x7(utf8_next(s, &i));
         for (int col = 0; col < 5; col++) for (int row = 0; row < 7; row++) if (g[col] >> row & 1)
-            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) ov_plot(px, w, h, x0 + i * 6 * scale + col * scale + dx, y0 + row * scale + dy, 220, 255);
+            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) ov_plot(px, w, h, x0 + cell * 6 * scale + col * scale + dx, y0 + row * scale + dy, 220, 255);
     }
 }
 // colour drawing for the menu button and the panel: straight alpha, "over" blending, shapes antialiased by their distance
@@ -321,16 +322,16 @@ static void cv_ring(const ov_canvas *cv, float cx, float cy, float r, float t, c
         cv_blend(cv, x, y, c, fminf(0.5f - (d - r), 0.5f + (d - (r - t))));
     }
 }
-static float cv_text_w(const char *s, int scale) { return (float)strlen(s) * 6 * scale - scale; }
+static float cv_text_w(const char *s, int scale) { return (float)glyph_count(s) * 6 * scale - scale; }
 static void cv_text(const ov_canvas *cv, float x, float cy, const char *s, int scale, const uint8_t c[4]) {   // x: the left edge
     int x0 = (int)(x + 0.5f), y0 = (int)(cy - 7 * scale / 2.0f + 0.5f);
-    for (int i = 0; s[i]; i++) {
-        unsigned ch = (unsigned char)s[i]; const unsigned char *g = FONT5X7[(ch >= 32 && ch < 127 ? ch : 63) - 32];
+    for (int i = 0, cell = 0; s[i]; cell++) {
+        const unsigned char *g = glyph5x7(utf8_next(s, &i));
         for (int col = 0; col < 5; col++) for (int row = 0; row < 7; row++) if (g[col] >> row & 1)
-            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) cv_blend(cv, x0 + i * 6 * scale + col * scale + dx, y0 + row * scale + dy, c, 1);
+            for (int dy = 0; dy < scale; dy++) for (int dx = 0; dx < scale; dx++) cv_blend(cv, x0 + cell * 6 * scale + col * scale + dx, y0 + row * scale + dy, c, 1);
     }
 }
-static const uint8_t C_WHITE[4] = {255, 255, 255, 255}, C_ACCENT[4] = {255, 60, 142, 255};
+static const uint8_t C_WHITE[4] = {255, 255, 255, 255}, C_ACCENT[4] = {255, 60, 142, 255}, C_HOT[4] = {255, 64, 48, 255};
 static void ov_menu_icon(const ov_canvas *cv, const ov_ctl *c, const float b[4]) {   // the menu button: a dark pill with a ring and three bars
     static const uint8_t fill[4] = {20, 20, 26, 170}, ring[4] = {255, 255, 255, 210};
     float r = b[3], t = fmaxf(2, r * 0.07f);
@@ -382,9 +383,10 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
                                               "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Shader prewarm", "Record 60 s", "Heavy mode", "MT replay",
-                                              "Battery saver", "Resume", ""};
+                                              "Battery saver", "Face buttons", "Resume", ""};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
+static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
 static void ov_menu_panel(const ov_canvas *cv, int st) {
     float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
     float rh = r[3], rw = r[2], gap = rh * 0.35f, sh = rh * 0.40f, sw = sh * 1.85f;
@@ -393,7 +395,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
     for (; is > 1; is--) {   // the widest row: its label, a gap and its control
         float need = 0;
         for (int i = 0; i < OVM_RESUME; i++) {
-            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
+            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
             need = fmaxf(need, i == OVM_OPACITY ? fmaxf(lw / 0.38f, cv_text_w("80%", is) / 0.14f) : lw + gap + cw + rh * 0.3f);
         }
         if (need <= rw) break;   // (the tabs' names are sized on their own)
@@ -445,11 +447,12 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, it == OVM_DRIVER && differs ? C_ACCENT : it == OVM_DRUN ? C_DIM : C_WHITE);
         } else if (OVM_BUTTONS[it]) {   // a button
             float bw = cv_text_w(OVM_BUTTONS[it], is) + 2 * sh, b[4] = {x1 - bw, cy - rh * 0.30f, bw, rh * 0.60f}; cv_button(cv, b, OVM_BUTTONS[it], 0, 0);
-        } else if (it == OVM_MODE) {   // two segments, the current one filled: handheld (performance) | docked (resolution)
-            int docked = st >> 2 & 1; float hh = rh * 0.46f, segw = fmaxf(cv_text_w(OVM_MODES[0], is), cv_text_w(OVM_MODES[1], is)) + sh, x0 = x1 - 2 * segw;
+        } else if (it == OVM_MODE || it == OVM_PAD) {   // two segments, the current one filled: handheld (performance) | docked (resolution); by position | by label
+            const char *const *seg = it == OVM_MODE ? OVM_MODES : OVM_PADS; int cur = it == OVM_MODE ? st >> 2 & 1 : st >> 30 & 1;   // (bit 28: Show FPS at ALL)
+            float hh = rh * 0.46f, segw = fmaxf(cv_text_w(seg[0], is), cv_text_w(seg[1], is)) + sh, x0 = x1 - 2 * segw;
             cv_rrect(cv, x0, cy - hh / 2, x1, cy + hh / 2, hh / 2, C_OFF);
-            cv_rrect(cv, x0 + docked * segw, cy - hh / 2, x0 + (docked + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
-            for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(OVM_MODES[k], is)) / 2, cy, OVM_MODES[k], is, k == docked ? C_WHITE : C_DIM);
+            cv_rrect(cv, x0 + cur * segw, cy - hh / 2, x0 + (cur + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
+            for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(seg[k], is)) / 2, cy, seg[k], is, k == cur ? C_WHITE : C_DIM);
         } else {   // a switch
             int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_C120 ? 27 : it == OVM_LOWLAT ? 7 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
@@ -594,8 +597,10 @@ static float ov_glow(int64_t t, int64_t now) {   // a held button's glow: bright
 static float ov_fps_cell(void) { return 6.0f * g_ov.gs + 2; }   // a character cell's width in texels (a glyph of 5 columns, a gap, a clear texel each side)
 static void ov_fps_glyphs(void) {   // the characters into the rows under the panel
     ov_canvas cv = {g_ov.px, g_ov.w, 0, g_ov.h + g_ov.sh + g_ov.ph, g_ov.w, g_ov.gh};
-    for (int i = 0; OV_FPS_CHARS[i]; i++) { char one[2] = {OV_FPS_CHARS[i], 0}; cv_text(&cv, i * ov_fps_cell() + 1 + g_ov.gs * 0.5f, g_ov.gh / 2.0f, one, (int)g_ov.gs, C_WHITE); }
+    int n = (int)strlen(OV_FPS_CHARS);   // white, then the first OV_HOT_CHARS in red (a temperature too hot: ov_fps) after them
+    for (int i = 0; i < n + OV_HOT_CHARS; i++) { char one[2] = {OV_FPS_CHARS[i < n ? i : i - n], 0}; cv_text(&cv, i * ov_fps_cell() + 1 + g_ov.gs * 0.5f, g_ov.gh / 2.0f, one, (int)g_ov.gs, i < n ? C_WHITE : C_HOT); }
 }
+__attribute__((weak)) void dm_android_temps(int *soc, int *bat) { (void)soc; (void)bat; }   // (front_android.c; absent in other builds)
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
     float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
     for (int j = 0; j < t->n; j++) if (t->sp[j].state == OVT_DECOR) { const ov_ctl *c = &L[t->sp[j].ctl]; ov_box(c, W, H, b); ov_tsp(cb, t, &t->sp[j], b[0], b[1], k * ov_cscale(c), alpha); }
@@ -653,11 +658,12 @@ static void kgsl_start(void) { pthread_t t; if (!pthread_create(&t, NULL, kgsl_t
 static void kgsl_ask(int64_t now) {   // the HUD shows: readings wanted (the thread started at the first ask); now: CLOCK_MONOTONIC ns, as the thread's
     static pthread_once_t once = PTHREAD_ONCE_INIT; atomic_store(&g_kgsl_want, now); pthread_once(&once, kgsl_start);
 }
-static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, const char *s) {   // a line of the counter's characters, its left edge at x
-    float gy = (float)(g_ov.h + g_ov.sh + g_ov.ph);
+static void ov_line(VkCommandBuffer cb, float x, float y, float cw, float ch, const char *s, int hot) {   // a line of the counter's characters, its left edge at x; hot: red
+    float gy = (float)(g_ov.h + g_ov.sh + g_ov.ph); int n = (int)strlen(OV_FPS_CHARS);
     for (int i = 0; s[i]; i++, x += cw) {
         const char *c = strchr(OV_FPS_CHARS, s[i]); if (!c || s[i] == ' ') continue;
-        float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(); ov_rect(cb, x, y, x + cw, y + ch, u, gy, u + ov_fps_cell(), gy + g_ov.gh, 1);
+        int j = (int)(c - OV_FPS_CHARS); if (hot && j < OV_HOT_CHARS) j += n;   // (the characters with a red copy: ov_fps_glyphs)
+        float u = (float)j * ov_fps_cell(); ov_rect(cb, x, y, x + cw, y + ch, u, gy, u + ov_fps_cell(), gy + g_ov.gh, 1);
     }
 }
 extern uint64_t g_gpu_ns;   // gfx_vk_core.c: the GPU's timestamped time, all submissions
@@ -680,8 +686,23 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     }
     char s[16]; if (fps < 0) snprintf(s, sizeof s, "-- FPS"); else snprintf(s, sizeof s, "%d FPS", fps > 999 ? 999 : fps);
     float k = (float)g_sext.width / g_ov.w, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k, m = (float)g_sext.height * 0.02f, x = m + ch * 0.25f, pad = ch * 0.2f;
-    if (level < 2) { ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + strlen(s) * cw, m + ch + 2 * pad, 0.45f); ov_line(cb, x, m + pad, cw, ch, s); return; }
-    // the HUD: three lines and the graph on one block
+    // the chip's and the battery's temperature where the device gives them (front_android.c dm_android_temps: whole degrees C, -1000 not known), red from where
+    // it is dangerously hot: the chip at 80 C (phones throttle hard in the high 80s), the battery at 45 C (Android's warnings and charging limits)
+    int soc = -1000, bat = -1000; dm_android_temps(&soc, &bat);
+    char ts[16] = "", tb[16] = ""; int hs = 0, hb = 0;
+    if (soc > -100 && soc < 1000) { hs = soc >= 80; snprintf(ts, sizeof ts, "SOC %dC", soc); }
+    if (bat > -100 && bat < 1000) { hb = bat >= 45; snprintf(tb, sizeof tb, "%dC", bat); }
+    if (level < 2) {   // the counter: FPS, then a row for each temperature known
+        const char *rows[3] = {s, NULL, NULL}; int hot[3] = {0}, nr = 1; char bt[16];
+        if (ts[0]) { hot[nr] = hs; rows[nr++] = ts; }
+        if (tb[0]) { snprintf(bt, sizeof bt, "BAT %s", tb); hot[nr] = hb; rows[nr++] = bt; }
+        size_t wmax = 0; for (int r = 0; r < nr; r++) if (strlen(rows[r]) > wmax) wmax = strlen(rows[r]);
+        float lh = ch * 1.1f;
+        ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + wmax * cw, m + 2 * pad + ch + (nr - 1) * lh, 0.45f);
+        for (int r = 0; r < nr; r++) ov_line(cb, x, m + pad + r * lh, cw, ch, rows[r], hot[r]);
+        return;
+    }
+    // the HUD: the lines (the chip's temperature's only where known) and the graph on one block
     float last = g_ft_n ? g_ft[(g_ft_i + OV_FT_N - 1) % OV_FT_N] : 0, worst = 0; for (int i = 0; i < g_ft_n; i++) if (g_ft[i] > worst) worst = g_ft[i];
     float period = fps > 0 ? 1000.0f / (fps > 45 ? 60 : fps > 35 ? 40 : 30) : 1000.0f / 60;   // the step the game runs at (60, 40, 30)
     char l2[32], l3[32], l4[32], l5[32];
@@ -692,16 +713,20 @@ static void ov_fps(VkCommandBuffer cb, int64_t now, int level) {
     else snprintf(l3, sizeof l3, "GPU --");
     { long c = atomic_load(&g_hud_cpu); int h = atomic_load(&g_hud_heat), b = atomic_load(&g_hud_bat);   // the prime core's clock and the thermal status (0 none .. 6)
       int o = c > 0 ? snprintf(l4, sizeof l4, "CPU %ldMHz", c) : snprintf(l4, sizeof l4, "CPU --"); if (h >= 0) snprintf(l4 + o, sizeof l4 - (size_t)o, " HEAT %d", h);
-      o = b >= 0 ? snprintf(l5, sizeof l5, "BAT %d%%", b) : snprintf(l5, sizeof l5, "BAT --"); if (atomic_load(&g_hud_saver)) snprintf(l5 + o, sizeof l5 - (size_t)o, " LOW"); }
+      o = b >= 0 ? snprintf(l5, sizeof l5, "BAT %d%%", b) : snprintf(l5, sizeof l5, "BAT --");
+      if (tb[0]) o += snprintf(l5 + o, sizeof l5 - (size_t)o, " %s", tb);   // "BAT 80% 38C" (red when the battery is hot)
+      if (atomic_load(&g_hud_saver)) snprintf(l5 + o, sizeof l5 - (size_t)o, " LOW"); }
+    int nlines = ts[0] ? 6 : 5;
     float gw = 18 * cw, gh = ch * 3, lh = ch + pad;
-    ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + 5 * lh + 3 * pad + gh, 0.5f);
-    ov_line(cb, x, m + pad, cw, ch, s); ov_line(cb, x, m + pad + lh, cw, ch, l2); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3);
-    ov_line(cb, x, m + pad + 3 * lh, cw, ch, l4); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l5);
+    ov_block(cb, SP_BLACK, m, m, m + ch * 0.5f + gw, m + nlines * lh + 3 * pad + gh, 0.5f);
+    ov_line(cb, x, m + pad, cw, ch, s, 0); ov_line(cb, x, m + pad + lh, cw, ch, l2, 0); ov_line(cb, x, m + pad + 2 * lh, cw, ch, l3, 0);
+    ov_line(cb, x, m + pad + 3 * lh, cw, ch, l4, 0); ov_line(cb, x, m + pad + 4 * lh, cw, ch, l5, hb);
+    if (ts[0]) ov_line(cb, x, m + pad + 5 * lh, cw, ch, ts, hs);
     // green up to: 5% over the period; with the 120 Hz container half a refresh over it (a frame handed over a little late still makes its refresh, and one that
     // misses shows a whole refresh longer: 25 ms for 60 fps at 120 Hz, amber)
     float ok_ms = period * 1.05f;
     if (dm_perf_container()) { const char *e = getenv("DM_DISPLAY_HZ"); float hz = e && atof(e) > 0 ? (float)atof(e) : 120; ok_ms = period + 500.0f / hz; }
-    float gx = x, gy = m + 5 * lh + 2 * pad, top = period * 2.5f, bwid = (gw - ch * 0.5f) / OV_FT_N;   // the graph: 2.5 periods tall, new frames on the right
+    float gx = x, gy = m + nlines * lh + 2 * pad, top = period * 2.5f, bwid = (gw - ch * 0.5f) / OV_FT_N;   // the graph: 2.5 periods tall, new frames on the right
     for (int i = 0; i < g_ft_n; i++) {
         float ms = g_ft[(g_ft_i + OV_FT_N - g_ft_n + i) % OV_FT_N], hgt = (ms > top ? top : ms) / top * gh, bx = gx + (OV_FT_N - g_ft_n + i) * bwid;
         ov_block(cb, ms <= ok_ms ? SP_GREEN : ms <= period * 1.5f ? SP_AMBER : SP_RED, bx, gy + gh - hgt, bx + bwid * 0.8f + 0.5f, gy + gh, 0.9f);
@@ -714,7 +739,7 @@ static void ov_prewarm(VkCommandBuffer cb) {
     char s[40]; snprintf(s, sizeof s, "SHADERS %zu/%zu", seen, total);
     float W = (float)g_sext.width, H = (float)g_sext.height, k = W / g_ov.w * 1.5f, cw = ov_fps_cell() * k, ch = (float)g_ov.gh * k;
     float tw = strlen(s) * cw, x = (W - tw) / 2, y = H * 0.5f - ch * 1.2f;
-    ov_line(cb, x, y, cw, ch, s);
+    ov_line(cb, x, y, cw, ch, s, 0);
     float bw = W * 0.4f, bh = H * 0.012f > 4 ? H * 0.012f : 4, bx = (W - bw) / 2, by = H * 0.5f + ch * 0.4f, f = total ? (float)seen / total : 0;
     ov_block(cb, SP_WHITE, bx, by, bx + bw, by + bh, 0.25f);
     ov_block(cb, SP_ACCENT, bx, by, bx + bw * f, by + bh, 1);
@@ -828,7 +853,8 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
             VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
         VKCHK(vkCreateSampler(V.dev, &si, NULL, &g_ov.samp));
     }
-    if (g_ov.pfmt != g_sfmt) {   // the pipeline renders into the swapchain's format
+    if (g_ov.pfmt != g_sfmt) {   // the pipeline renders into the swapchain's format (the last format's goes: swap_destroy waited for the device on every path that changes g_sfmt)
+        if (g_ov.pipe) { vkDestroyPipeline(V.dev, g_ov.pipe, NULL); g_ov.pipe = VK_NULL_HANDLE; }
         VkShaderModule vm, fm;
         VkShaderModuleCreateInfo vc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof overlay_vert_spv, overlay_vert_spv}; VKCHK(vkCreateShaderModule(V.dev, &vc, NULL, &vm));
         VkShaderModuleCreateInfo fc = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, sizeof overlay_frag_spv, overlay_frag_spv}; VKCHK(vkCreateShaderModule(V.dev, &fc, NULL, &fm));
@@ -845,7 +871,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &g_sfmt};
         if (!V.has_dynrender && g_ov.rp) { ov_fb_drop(); vkDestroyRenderPass(V.dev, g_ov.rp, NULL); g_ov.rp = VK_NULL_HANDLE; }   // the pass follows the swapchain's format, as the pipeline does
         VkRenderPass orp = V.has_dynrender ? VK_NULL_HANDLE : ov_rp();
-        if (!V.has_dynrender && !orp) return 0;
+        if (!V.has_dynrender && !orp) { vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL); return 0; }
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, orp ? NULL : &rci, 0, 2, ss, &vi, &ia, NULL, &vs, &rs, &ms, NULL, &cbs, &dy, g_ov.layout, orp};
         VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &g_ov.pipe);
         vkDestroyShaderModule(V.dev, vm, NULL); vkDestroyShaderModule(V.dev, fm, NULL);
@@ -859,7 +885,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         if (g_ov.view) { vkDestroyImageView(V.dev, g_ov.view, NULL); vkDestroyImage(V.dev, g_ov.img, NULL); vkFreeMemory(V.dev, g_ov.mem, NULL); vkDestroyBuffer(V.dev, g_ov.up, NULL); vkFreeMemory(V.dev, g_ov.upm, NULL); }
         g_ov.lay = lay; uint32_t sh = ov_layout_sprites(w, h); float mr[4]; ov_menu_rect((float)g_sext.width, (float)g_sext.height, mr);
         g_ov.pw = (uint32_t)(mr[2] / 2) + 1; g_ov.ph = (uint32_t)(mr[3] / 2) + 1; if (g_ov.pw > w) g_ov.pw = w;
-        g_ov.gs = (uint32_t)fmaxf(2, roundf(h * 0.035f / 7)); g_ov.gh = 7 * g_ov.gs + 4;   // the counter's characters: 3.5% of the window's height
+        g_ov.gs = (uint32_t)fmaxf(2, roundf(h * 0.022f / 7)); g_ov.gh = 7 * g_ov.gs + 4;   // the counter's characters: 2.2% of the window's height
         uint32_t th = h + sh + g_ov.ph + g_ov.gh;
         VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {w, th, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
@@ -1142,6 +1168,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         VKLOG("replay per frame (last 600): %.0f draws, replay %.2f ms (descriptor sets %.2f, pipeline keys %.2f), queue submit %.2f ms, uniform shadows %.0f KB; GPU busy %.2f ms; texture uploads %.1f (%.2f MB, %.2f ms); descriptor sets reused %llu, new %llu (collecting %.2f ms, hashing %.2f, new ones %.2f), kept per stage %.0f a frame (memo differences %llu)",
               nd, (g_vkst.ns_exec - pe) / 6e8, (g_vkst.ns_desc - pd) / 6e8, (g_vkst.ns_pipe - pp) / 6e8, (g_ns_submit - ps) / 6e8, (g_ubd_bytes - pb) / 600.0 / 1024, (g_gpu_ns - pg) / 6e8, (g_pkg_n - pkn) / 600.0, (g_pkg_bytes - pkb) / 600.0 / 1048576, (g_pkg_ns - pkt) / 6e8, (unsigned long long)g_set_hits, (unsigned long long)g_set_new, (g_ns_set_build - psb) / 6e8, (g_ns_set_hash - psh) / 6e8, (g_ns_set_new - psn) / 6e8,
               (g_set_memo - psm) / 600.0, (unsigned long long)g_set_memo_bad);
+        { extern uint64_t g_order_kept, g_order_ended; static uint64_t pk, pn;   // gfx_vk_exec.c g_order_keep
+          if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
+          pk = g_order_kept; pn = g_order_ended; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }
@@ -1170,7 +1199,8 @@ vkimg_t *vk_image_from_ahb(AHardwareBuffer *ahb, uint32_t w, uint32_t h) {
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &imp, im->img, VK_NULL_HANDLE};
     uint32_t mt = 0; while (mt < 32 && !(ap.memoryTypeBits & (1u << mt))) mt++;
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded, ap.allocationSize, mt};
-    if (vkAllocateMemory(V.dev, &ai, NULL, &im->mem) || vkBindImageMemory(V.dev, im->img, im->mem, 0)) { VKRED_ONCE(94, "importing a GL frame buffer into Vulkan failed"); free(im); return NULL; }
+    if (vkAllocateMemory(V.dev, &ai, NULL, &im->mem) || vkBindImageMemory(V.dev, im->img, im->mem, 0)) { VKRED_ONCE(94, "importing a GL frame buffer into Vulkan failed");
+        if (im->mem) vkFreeMemory(V.dev, im->mem, NULL); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }   // (tried again at the next frame: nothing of this one stays)
     im->fmt = VK_FORMAT_R8G8B8A8_UNORM; im->w = w; im->h = h; im->d = im->layers = im->levels = im->samples = 1; im->aspect = VK_IMAGE_ASPECT_COLOR_BIT; im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VKLOG("GL frame buffer %ux%u imported (memory type %u, %llu bytes)", w, h, mt, (unsigned long long)ap.allocationSize);
     return im;
