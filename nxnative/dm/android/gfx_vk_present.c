@@ -236,7 +236,7 @@ enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_GREEN, SP_AMBER, SP_RED
 #define OV_FPS_CHARS "0123456789 FPSCBATO-GUms.%MHzDER/LW"   // (the temperature rows: "SOC 52C", "BAT 38C"; the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
 #define OV_HOT_CHARS 19   // the first 19 (the temperature rows' characters) again in red after them: all 35 twice would not fit a 960-texel raster (1920 x 1080)
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
-                VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs, upk; float div; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
+                VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs, upk; float div; VkBuffer up; VkDeviceMemory upm; uint8_t *px, *map; int uploaded, panel, lay, cver; float sp[SP_N][4];
                 VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov;
 static struct { const ov_theme *t; VkImage img; VkDeviceMemory mem; VkImageView view; VkDescriptorSet set; VkBuffer up; VkDeviceMemory upm; uint32_t upk; int ready; } g_tt[2];   // per layout
 // Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) the overlay draws in a render pass object over the swapchain image: one pass for the swapchain's
@@ -953,7 +953,10 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         VKCHK(vkCreateBuffer(V.dev, &bc, NULL, &g_ov.up)); VkMemoryRequirements bq; vkGetBufferMemoryRequirements(V.dev, g_ov.up, &bq);
         VkMemoryAllocateInfo bi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, bq.size, vk_mem_type(bq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
         VKCHK(vkAllocateMemory(V.dev, &bi, NULL, &g_ov.upm)); VKCHK(vkBindBufferMemory(V.dev, g_ov.up, g_ov.upm, 0));
-        void *px; VKCHK(vkMapMemory(V.dev, g_ov.upm, 0, VK_WHOLE_SIZE, 0, &px)); g_ov.px = px;
+        // drawn in ordinary memory (px), copied into the mapped upload buffer (map) row by row as it goes up: the mapped memory is uncached on the
+        // Adreno driver, and blending reads every texel it writes, which made a pause menu change take 230 ms (546 x 497 texels) instead of a few
+        void *mp; VKCHK(vkMapMemory(V.dev, g_ov.upm, 0, VK_WHOLE_SIZE, 0, &mp)); g_ov.map = mp;
+        free(g_ov.px); g_ov.px = calloc((size_t)w * th, 4); if (!g_ov.px) { VKRED_ONCE(131, "overlay: no memory for its %ux%u raster", w, th); return 0; }
         g_ov.w = w; g_ov.h = h; g_ov.sh = sh; ov_raster(g_ov.px, w, h, sh); memset(g_ov.px + (size_t)w * (h + sh) * 4, 0, (size_t)w * (g_ov.ph + g_ov.gh) * 4); ov_fps_glyphs();
         VkDescriptorImageInfo ii = {g_ov.samp, g_ov.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_ov.set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii};
@@ -976,6 +979,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_ov.img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
         VkBufferImageCopy c = {(VkDeviceSize)y0 * g_ov.w * 4, g_ov.w, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, (int32_t)y0, 0}, {g_ov.w, rows, 1}};
+        memcpy(g_ov.map + (size_t)y0 * g_ov.w * 4, g_ov.px + (size_t)y0 * g_ov.w * 4, (size_t)rows * g_ov.w * 4);   // (the rows going up, written once, in order)
         vkCmdCopyBufferToImage(cb, g_ov.up, g_ov.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c); g_ov.upk = k;
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);

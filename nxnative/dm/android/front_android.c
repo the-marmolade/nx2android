@@ -200,7 +200,11 @@ static void shake_sensor(int on);   // the accelerometer, off in the background 
 static void go_background(void) { if (!atomic_load(&g_running) || atomic_exchange(&g_bg, 1)) return; dm_focus_set(2); dm_focus_set(3);   // through OutOfFocus, as a game sees HOME and then the suspension (front_mac.m does the same)
     hold_sync(); dm_gfx_suspend(1); shake_sensor(0); }
 static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); }
-static void on_pause(ANativeActivity *a) { (void)a; go_background(); }
+// The game goes to the background when the activity stops (no longer seen), not when it pauses: an activity paused while still on screen (Android's MTP
+// helper opening and closing in a tenth of a second when a USB-C video adapter connects, its hub a USB device) had the graphics suspended and the audio
+// stream closed and opened again, a second's stutter each time a television was plugged in
+static void on_pause(ANativeActivity *a) { (void)a; }
+static void on_stop(ANativeActivity *a) { (void)a; go_background(); }
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
@@ -235,6 +239,8 @@ static void hide_system_bars(ANativeActivity *a) {
 }
 static void on_window_focus(ANativeActivity *a, int focused) {
     if (focused) hide_system_bars(a);
+    // in TV mode the input focus moves between the app's own windows (the television's presentation, the device's gamepad): the game stays in focus
+    if (!focused && dm_external_active()) return;
     if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2);
 }
 // A save manager's request, or a RomFS the app cannot read (romfs_readable), asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
@@ -1366,7 +1372,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     int sdk; { AConfiguration *cfg = AConfiguration_new(); AConfiguration_fromAssetManager(cfg, act->assetManager); g_dpi = AConfiguration_getDensity(cfg); sdk = AConfiguration_getSdkVersion(cfg); AConfiguration_delete(cfg); }
     act->callbacks->onNativeWindowCreated = on_window_created; act->callbacks->onNativeWindowDestroyed = on_window_destroyed;
     act->callbacks->onInputQueueCreated = on_queue_created; act->callbacks->onInputQueueDestroyed = on_queue_destroyed;
-    act->callbacks->onPause = on_pause; act->callbacks->onResume = on_resume; act->callbacks->onWindowFocusChanged = on_window_focus; act->callbacks->onDestroy = on_destroy;
+    act->callbacks->onPause = on_pause; act->callbacks->onStop = on_stop; act->callbacks->onResume = on_resume; act->callbacks->onWindowFocusChanged = on_window_focus; act->callbacks->onDestroy = on_destroy;
     ANativeActivity_setWindowFlags(act, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
     g_sdk = sdk; hide_system_bars(act);
     static int started; if (started++) return;   // a second onCreate (configuration change) keeps the running game

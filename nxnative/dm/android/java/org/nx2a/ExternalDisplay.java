@@ -67,14 +67,28 @@ public final class ExternalDisplay implements DisplayManager.DisplayListener {
         return name != null && (name.startsWith("Built-in") || name.matches("Screen-\\d+"));
     }
 
-    /** The display's mode for the game: the most pixels (a 4K television's 3840x2160 rather than the 1080p it may start in), and at that size the refresh rate nearest
-     *  60 Hz from above, which the game's 60 and 30 fps divide. Null when the display lists none. */
+    /** The display's mode for the game: the resolution the display is in already (the one it and Android agreed on when the cable went in, a television's
+     *  own: 3840x2160 on a 4K one), at the refresh rate nearest 60 Hz from above, which the game's 60 and 30 fps divide. Another resolution would make the
+     *  television renegotiate the link, and the most pixels is not the best: a 4K television also lists the cinema 4096x2160, which it scales or crops.
+     *  With no current mode, the largest 16:9 one (any shape when none is). Null when the display lists none. */
     public static Display.Mode bestMode(Display d) {
-        Display.Mode best = null; long area = -1; float rate = 0;
-        for (Display.Mode m : d.getSupportedModes()) {
-            long a = (long) m.getPhysicalWidth() * m.getPhysicalHeight(); float r = m.getRefreshRate();
-            boolean better = a > area || (a == area && (rate < 59.5f ? r > rate : r >= 59.5f && r < rate));
-            if (better) { best = m; area = a; rate = r; }
+        Display.Mode cur = d.getMode();
+        Display.Mode best = pickRate(d.getSupportedModes(), cur == null ? -1 : cur.getPhysicalWidth(), cur == null ? -1 : cur.getPhysicalHeight());
+        if (best != null) return best;
+        long area = -1; int w = -1, h = -1; boolean wide = false;
+        for (Display.Mode m : d.getSupportedModes()) {   // the size: 16:9 first, then the most pixels
+            long a = (long) m.getPhysicalWidth() * m.getPhysicalHeight(); boolean x = (long) m.getPhysicalWidth() * 9 == (long) m.getPhysicalHeight() * 16;
+            if ((x && !wide) || (x == wide && a > area)) { area = a; w = m.getPhysicalWidth(); h = m.getPhysicalHeight(); wide = x; }
+        }
+        return pickRate(d.getSupportedModes(), w, h);
+    }
+
+    private static Display.Mode pickRate(Display.Mode[] modes, int w, int h) {   // of the modes of that size, the refresh rate nearest 60 Hz from above
+        Display.Mode best = null; float rate = 0;
+        for (Display.Mode m : modes) {
+            if (m.getPhysicalWidth() != w || m.getPhysicalHeight() != h) continue;
+            float r = m.getRefreshRate();
+            if (best == null || (rate < 59.5f ? r > rate : r >= 59.5f && r < rate)) { best = m; rate = r; }
         }
         return best;
     }

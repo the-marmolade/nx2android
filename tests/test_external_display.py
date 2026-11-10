@@ -56,6 +56,14 @@ public class Check {
   a.manager.displays=new Display[]{lower, tv}; d.start(); if(Presentation.last!=tv||Window.lastMode!=13)throw new AssertionError("television mode"); d.stop();
   // already in its best mode: no mode is asked for (another would make the television renegotiate the link)
   tv.current=tv.getSupportedModes()[2]; Window.lastMode=0; d.start(); if(Presentation.last!=tv||Window.lastMode!=0)throw new AssertionError("mode asked for again"); d.stop();
+  // a 4K television in its own 3840x2160 at 60 Hz, also listing the cinema 4096x2160: it stays as it is
+  Display uhd=new Display(12, 2, "DP Screen", new Display.Mode(383, 3840, 2160, 60f), new Display.Mode(384, 4096, 2160, 60f), new Display.Mode(385, 3840, 2160, 30f), new Display.Mode(386, 1920, 1080, 60f));
+  uhd.current=uhd.getSupportedModes()[0]; if(ExternalDisplay.bestMode(uhd).getModeId()!=383)throw new AssertionError("cinema 4K taken");
+  Window.lastMode=0; a.manager.displays=new Display[]{lower, uhd}; d.start(); if(Presentation.last!=uhd||Window.lastMode!=0)throw new AssertionError("mode changed"); d.stop();
+  // in its own resolution at 30 Hz: the same resolution at 60, not another size
+  uhd.current=uhd.getSupportedModes()[2]; if(ExternalDisplay.bestMode(uhd).getModeId()!=383)throw new AssertionError("refresh");
+  // no current mode: the largest 16:9 one, not the cinema 4096x2160
+  uhd.current=null; if(ExternalDisplay.bestMode(uhd).getModeId()!=383)throw new AssertionError("fallback " + ExternalDisplay.bestMode(uhd).getModeId());
  }
 }''',
 }
