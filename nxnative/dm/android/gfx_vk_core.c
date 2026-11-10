@@ -24,6 +24,7 @@
 VK_FNS(VK_DEF) VK_DEV_FNS(VK_DEF)
 static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
 vkdev_t V;
+#include "gfx_vk_pipeline_cache.inc"
 pthread_mutex_t g_vk_queue_mu = PTHREAD_MUTEX_INITIALIZER;   // VkQueue access is externally synchronized: submissions and presents
 
 // DM_VK_MEM_DIAG=1 at startup: observe copied-pool costs without changing memory protection or rendering.
@@ -130,15 +131,6 @@ static int drv_has_gpu(PFN_vkGetInstanceProcAddr g) {
 
 static int g_drv_custom;   // vk_init loaded the APK's driver (DM_VK_DRIVER), not the system's: the pause menu's Driver tab shows it (front_android.c dm_driver_names)
 int dm_vk_driver_custom(void) { return g_drv_custom; }
-// The pipeline cache's file for this driver: vk_pipeline_cache-<the first 8 bytes of pipelineCacheUUID in hex>.bin (a driver's UUID changes with its build)
-static void pcache_path(char *out, size_t cap, const char *root) {
-    const uint8_t *u = V.props.pipelineCacheUUID;
-    snprintf(out, cap, "%s/vk_pipeline_cache-%02x%02x%02x%02x%02x%02x%02x%02x.bin", root, u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]);
-}
-static int pcache_ours(const void *d, size_t n) {   // the cache's header (VkPipelineCacheHeaderVersionOne) names this driver: no driver is handed another's data
-    const uint8_t *p = d; uint32_t h[4]; if (n < 32) return 0; memcpy(h, p, sizeof h);
-    return h[0] >= 32 && h[1] == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && h[2] == V.props.vendorID && h[3] == V.props.deviceID && !memcmp(p + 16, V.props.pipelineCacheUUID, VK_UUID_SIZE);
-}
 void vk_init(void) {
     static int done; if (done) return; done = 1;
     // DM_VK_DRIVER=<library>: a Vulkan driver the APK carries (Mesa's Turnip for Adreno; porter --vulkan-driver), loaded through libadrenotools (BSD-2-Clause), which the
@@ -319,22 +311,7 @@ void vk_init(void) {
     }
     { void vk_dq_init(void); vk_dq_init(); }   // DM_VK_MT_REPLAY: the vkCmd* calls through the recorder thread (gfx_vk_dq.c)
     vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
-    VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    char path[1024]; const char *root = getenv("DM_ROOT"); void *data = NULL; size_t dn = 0;
-    // One cache per driver (pcache_path: the driver's pipelineCacheUUID in the name): the pause menu's Driver tab switches between the system's driver and the
-    // APK's, and with one file each switch threw the other's cache away (a driver drops a cache not its own), so switching back compiled every pipeline again.
-    // A launch with no file of its own yet takes the old single vk_pipeline_cache.bin when its header is this driver's. DM_VK_NOPCACHE=1: start empty
-    for (int k = 0; k < 2 && root && !getenv("DM_VK_NOPCACHE") && !dn; k++) {
-        if (k == 0) pcache_path(path, sizeof path, root); else snprintf(path, sizeof path, "%s/vk_pipeline_cache.bin", root);
-        FILE *f = fopen(path, "rb"); if (!f) continue;
-        fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-        if (n > 32) { data = malloc((size_t)n); if (fread(data, 1, (size_t)n, f) == (size_t)n && pcache_ours(data, (size_t)n)) dn = (size_t)n; else { free(data); data = NULL; } }
-        fclose(f);
-        if (dn) VKLOG("[vk] pipeline cache: %s (%zu KB)", path, dn >> 10);
-    }
-    pci.initialDataSize = dn; pci.pInitialData = data;
-    if (vkCreatePipelineCache(V.dev, &pci, NULL, &V.pcache)) { pci.initialDataSize = 0; pci.pInitialData = NULL; VKCHK(vkCreatePipelineCache(V.dev, &pci, NULL, &V.pcache)); }
-    free(data); free(ex);
+    size_t dn = pcache_load(); free(ex);
     VKLOG("%s, Vulkan %u.%u, driver %#x; timeline semaphores %s, BC %s, ASTC %s, geometry shaders %s, nullDescriptor %s, custom border colours %s, depth clip control %s, transform feedback %s; pipeline cache %zu bytes",
           V.props.deviceName, VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion), V.props.driverVersion, V.has_timeline ? "yes" : "no (fences)",
           V.has_bc ? "yes" : "no (decoded on the CPU)", V.has_astc ? "yes" : "no", V.has_gs ? "yes" : "no", V.has_robust2 ? "yes" : "no", V.has_custom_border ? "yes" : "no", V.has_depth_clip_ctl ? "yes" : "no", V.has_xfb ? "yes" : "no", dn);
@@ -349,17 +326,6 @@ const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local) {
     // a compute workgroup must fit in maxComputeWorkgroupSubgroups subgroups of the pinned size (VUID-VkPipelineShaderStageCreateInfo-pNext-02756): a larger one keeps the driver's size
     if (local && (uint64_t)local[0] * local[1] * local[2] > (uint64_t)V.sg_pin.requiredSubgroupSize * V.sg_maxwgs) return NULL;
     return &V.sg_pin;
-}
-void vk_pipeline_cache_save(void) {
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static size_t last;
-    const char *root = getenv("DM_ROOT"); if (!root || !V.pcache) return;
-    pthread_mutex_lock(&mu);
-    size_t n = 0; if (vkGetPipelineCacheData(V.dev, V.pcache, &n, NULL) || !n || n == last) { pthread_mutex_unlock(&mu); return; }   // unchanged since the last save
-    last = n; pthread_mutex_unlock(&mu);
-    void *d = malloc(n); if (vkGetPipelineCacheData(V.dev, V.pcache, &n, d)) { free(d); return; }
-    char path[1024], tmp[1100]; pcache_path(path, sizeof path, root); snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE *f = fopen(tmp, "wb"); if (f) { fwrite(d, 1, n, f); fclose(f); rename(tmp, path); }
-    free(d);
 }
 
 // ---------------- memory pools ----------------
