@@ -1444,6 +1444,9 @@ static void shot(vkimg_t *im, uint64_t n) {
 }
 static pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // the swapchain against the window going away (vk_window_lost, on the main thread)
 void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); g_swap_why = "window handed over"; swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
+// a window going (the television unplugged, the activity's own taken away): the swapchain goes only when it is on that window. The present may have
+// moved to the other window already (dm_front_window changed first), and dropping that one too made it twice
+void vk_window_lost_for(ANativeWindow *w) { pthread_mutex_lock(&g_present_mu); if (w && g_win == w) { g_swap_why = "its window went"; swap_destroy(); g_win = NULL; } pthread_mutex_unlock(&g_present_mu); }
 // The present thread: mtl_present only queues the frame and returns (as on Apple), so the game thread never waits in vkAcquireNextImageKHR or on the
 // swapchain's fences (a FIFO swapchain blocks there until a vsync); the window texture is not drawn again before its blit, because NVN's acquire waits for
 // its ticket (mtl_present_wait), and the blit's submission comes after the frame's own on the one queue. DM_VK_SYNC_PRESENT=1 presents on the game thread.

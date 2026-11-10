@@ -58,17 +58,18 @@ ANativeWindow *dm_front_window(void) { pthread_mutex_lock(&g_win_mu); ANativeWin
 static ANativeWindow *phone_window(void) { pthread_mutex_lock(&g_win_mu); ANativeWindow *w = g_win; pthread_mutex_unlock(&g_win_mu); return w; }
 int dm_external_active(void) { return atomic_load(&g_external_active); }
 __attribute__((weak)) void vk_window_lost(void) {}   // the backend lets go of the window's swapchain before the window goes
+__attribute__((weak)) void vk_window_lost_for(ANativeWindow *w) { (void)w; vk_window_lost(); }   // (gfx_vk_present.c: only when the swapchain is on w)
 static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = w; pthread_mutex_unlock(&g_win_mu); }
-// the activity's own window going: the swapchain on it goes too, unless the game is on a television (TV mode: the device's gamepad covers the activity,
-// and Android takes its window away while the game draws to the television's, which made the television's swapchain again at each plug-in)
-static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_win_mu); g_win = NULL; int ext = g_external_win != NULL; pthread_mutex_unlock(&g_win_mu); if (!ext) vk_window_lost(); }
+// the activity's own window going: the swapchain goes only if it is on that window (in TV mode the device's gamepad covers the activity and Android takes its
+// window away while the game draws to the television's, which made the television's swapchain again at each plug-in)
+static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = NULL; pthread_mutex_unlock(&g_win_mu); vk_window_lost_for(w); }
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *env, jclass cls, jobject surface) {
     (void)cls;
     ANativeWindow *next = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
     pthread_mutex_lock(&g_win_mu); int same = next && next == g_external_win; pthread_mutex_unlock(&g_win_mu);
     if (same) { ANativeWindow_release(next); return; }   // the same surface reported again (Android does, 70 ms after the first): its swapchain stays
     pthread_mutex_lock(&g_win_mu); ANativeWindow *old = g_external_win; g_external_win = next; atomic_fetch_add(&g_external_epoch, 1); atomic_store(&g_external_active, next != NULL); pthread_mutex_unlock(&g_win_mu);
-    vk_window_lost();
+    vk_window_lost_for(old);   // (a plug-in: the present moves to the television's window by itself, dm_front_window)
     if (old) ANativeWindow_release(old);
     if (!next) { atomic_store(&g_ext_buttons, 0); atomic_store(&g_ext_presses, 0); atomic_store(&g_ext_menu, 0); dm_input_set(0, 0, 0, 0, 0); }
 }
