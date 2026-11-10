@@ -87,6 +87,13 @@ def _parser():
     hs.add_argument('--package', default='', help='the app (default: the only ported game installed)')
     hs.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)')
     hs.add_argument('--jobs', type=int, default=os.cpu_count() or 8); hs.add_argument('--json', action='store_true')
+    hs.add_argument('--folder', default='', help="the port's build folder (<title ID>_build) or the game folder that holds it: a port from a derived profile, or one made before "
+                                                   'nx2android recorded its profile, is checked against it (remembered after an update)')
+    hs.add_argument('--force', action='store_true', help='update even when the code rewriter changed since the port (a port again is the safe way)')
+    up = sub.add_parser('updates', help='the ported games on the device and whether each can be brought to this version (porter host)')
+    up.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)')
+    up.add_argument('--folder', action='append', default=[], metavar='TITLEID=FOLDER', help="a game's build folder (see porter host --folder); may repeat")
+    up.add_argument('--json', action='store_true')
     return ap
 
 
@@ -269,17 +276,34 @@ def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt 
     try:
         with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):   # with --json, stdout is the one JSON document
             cfg = config.load(); adb = saves.connect(toolchain.find_adb(cfg), a.device or cfg.get('device'))
-            out = driver.swap(adb, saves.pick_app(adb, a.package), None if a.system else a.library) if a.cmd == 'driver' else \
-                  host.update(adb, saves.pick_app(adb, a.package), a.jobs)
+            if a.cmd == 'driver': out = driver.swap(adb, saves.pick_app(adb, a.package), None if a.system else a.library)
+            elif a.cmd == 'host': out = host.update(adb, saves.pick_app(adb, a.package), a.jobs, folder=a.folder, force=a.force)
+            else:   # updates
+                folders = {k.upper(): v for k, v in (f.split('=', 1) for f in a.folder if '=' in f)}
+                out = {'version': host.checkout_version(), 'games': []}
+                for pkg in saves.apps(adb):
+                    try:
+                        r = host.inspect(adb, pkg)
+                        if r.get('title_id') in folders: r = host.inspect(adb, pkg, folders[r['title_id']])
+                    except BuildError as e: r = {'package': pkg, 'name': pkg, 'status': 'port', 'reason': str(e)}
+                    out['games'].append(r)
     except BuildError as e:
         if a.json: _print_json({'error': str(e)})
         else: print(e, file=sys.stderr)
         return 1
     if a.json: _print_json(out)
+    elif a.cmd == 'updates':
+        print(f'this version: {out["version"]}')
+        for g in out['games']:
+            print(f'{g["name"][:34]:34} {g.get("display", ""):9} {STATUS_WORD.get(g["status"], g["status"]):18} {g.get("reason", "")}')
+        if not out['games']: print('no ported game is installed')
     return 0
+
+
+STATUS_WORD = {'current': 'up to date', 'update': 'update available', 'risky': 'rewriter changed', 'folder': 'needs its folder', 'port': 'port again'}
 
 
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver}[a.cmd](a)

@@ -810,6 +810,11 @@ class Port:
         self.result['theme'] = pack.name; say(f'gamepad theme: {pack.name}')
         return [a for f in files for a in ('--asset', f'overlay/{f.name}={f}')]
 
+    def host_stamp(self):   # which sources the host came from (nx2a-data.json host): porter updates shows the port up to date until they change
+        from porter import host
+        try: return {'version': host.checkout_version(), 'fingerprint': host.host_fingerprint(self.g.id.upper())}
+        except OSError: return None
+
     def ui_font(self):
         """The overlay's font (dm/android/overlay_theme.c dm_overlay_font) and, as its license asks, the license files beside it, as assets/font/"""
         return [a for n, f in ui_font_assets().items() for a in ('--asset', f'{n}={f}')]
@@ -844,7 +849,7 @@ class Port:
                              + ([f'DM_VK_DRIVER={self.drivers[0][2]}', 'DM_VK_DRIVERS=' + ';'.join(f'{n}={lib}' for n, _, lib in self.drivers)] if self.drivers else [])
                              + presets.env_rows(presets.get(self.o.preset), self.ap.env, self.o.gpu_turbo),
                              settings={**(presets.get(self.o.preset).settings if self.o.preset else {}), **(TOUCH_SETTINGS if self.o.touch else {})} or None,
-                             files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None),
+                             files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None), host=self.host_stamp(),
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')

@@ -1,6 +1,6 @@
 # porter driver without a device: another Vulkan driver library in an installed port's APK (nxnative/dm/android/apk/apkdriver.py) and env.txt's DM_VK_DRIVER row
 # (porter/driver.py). The device is made up: pull hands over an APK built by mkapk.py, install and push keep what they were given (python -m unittest discover tests).
-import json, os, shutil, subprocess, sys, tempfile, unittest, zipfile
+import json, os, re, shutil, subprocess, sys, tempfile, unittest, zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -173,15 +173,21 @@ class HostTest(unittest.TestCase):   # porter host's update(): its refusals, the
         self.addCleanup(shutil.rmtree, self.t, ignore_errors=True)
         so = self.t / 'libdmhost.so'; so.write_bytes(b'\x7fELF old host' * 8)
         subprocess.run([sys.executable, str(APK / 'mkapk.py'), str(so), str(self.t / 'a.apk'), str(paths.signing_key()), '--lib', 'dmhost', '--release'], check=True, capture_output=True)
-        self.builds, real = [], subprocess.run
+        self.builds, self.envs, real = [], [], subprocess.run
         def run(argv, *a, **kw):   # build.py stood in for: a made-up libdmhost.so in --out; everything else (apkdriver.py, game.py header) runs
             argv = [str(x) for x in argv]
             if argv[1].endswith('build.py'):
-                self.builds.append(argv); out = Path(argv[argv.index('--out') + 1]); (out / 'libdmhost.so').write_bytes(b'\x7fELF new host' * 8)
+                self.builds.append(argv); self.envs.append(kw.get('env') or {}); out = Path(argv[argv.index('--out') + 1]); (out / 'libdmhost.so').write_bytes(b'\x7fELF new host' * 8)
                 return subprocess.CompletedProcess(argv, 0, '', '')
             return real(argv, *a, **kw)
-        for p in (mock.patch.object(host.subprocess, 'run', side_effect=run), mock.patch.object(host.toolchain, 'find_ndk', return_value=(self.t / 'ndk', '27.2'))):
+        for p in (mock.patch.object(host.subprocess, 'run', side_effect=run), mock.patch.object(host.toolchain, 'find_ndk', return_value=(self.t / 'ndk', '27.2')),
+                  mock.patch.object(host, 'find_build_folder', side_effect=lambda tid, hint='': self.folder), mock.patch.object(host, 'remember_folder')):   # nothing of this PC's folders or settings
             p.start(); self.addCleanup(p.stop)
+        self.folder = None
+
+    def build_folder(self, header):   # a port's build folder whose host was built with header (porter host --folder)
+        bf = self.t / f'{self.BDSP}_build'; h = bf / 'android/host/gen' / self.BDSP / 'game_profile.h'; h.parent.mkdir(parents=True, exist_ok=True); h.write_bytes(header)
+        return bf
 
     def files(self, **man):
         import hashlib
@@ -221,7 +227,32 @@ class HostTest(unittest.TestCase):   # porter host's update(): its refusals, the
             apk = self.t / 'installed.apk'; apk.write_bytes(dev.installed_apk); self.assertEqual(libs(apk)['libdmhost.so'], b'\x7fELF new host' * 8)
             from porter.pipeline import UI_FONT
             with zipfile.ZipFile(apk) as z: self.assertEqual(z.read('assets/font/ui.bin'), UI_FONT.read_bytes())   # the overlay font an older port lacks
-            self.assertEqual(dev.ops[-3:], ['pull', 'am', 'install'])
+            self.assertEqual(dev.ops[-4:], ['pull', 'am', 'install', 'push'])   # then nx2a-host.json: porter updates shows it up to date
+
+    def test_status(self):   # porter updates: up to date by the sources' fingerprint, from the update's stamp or the port's manifest
+        fp = self.host.host_fingerprint(self.BDSP)
+        f = self.files(); f[self.host.STAMP] = json.dumps({'version': 'v1', 'fingerprint': fp})
+        s = self.host.inspect(HostDevice(self.t / 'a.apk', f), PKG); self.assertEqual((s['status'], s['installed']), ('current', 'v1'))
+        self.assertEqual(self.host.inspect(HostDevice(self.t / 'a.apk', self.files(host={'version': 'v0', 'fingerprint': fp})), PKG)['status'], 'current')
+        self.assertEqual(self.host.inspect(HostDevice(self.t / 'a.apk', self.files(host={'version': 'v0', 'fingerprint': '0' * 64})), PKG)['status'], 'update')
+        f = self.files(); f['mods/build_src.sha256'] = f['mods/build_src.sha256'].replace(f['mods/build_src.sha256'][:64], '0' * 64)
+        self.assertEqual(self.host.inspect(HostDevice(self.t / 'a.apk', f), PKG)['status'], 'risky')
+        out = self.host.update(HostDevice(self.t / 'a.apk', f), PKG, force=True); self.assertEqual(out['title_id'], self.BDSP)   # --force: updated anyway
+
+    def test_build_folder(self):   # a port without profile_h, or from a derived profile: checked against the header its build folder's host was built with
+        header = self.host.profile_header(self.BDSP)
+        self.folder = self.build_folder(header.replace(b'#define DM_GAME_SMALL_VPOOL_SPARSE 0\n', b''))   # a port from before a new setting (at its default)
+        self.assertEqual(self.host.inspect(HostDevice(self.t / 'a.apk', self.files(profile_h=None)), PKG)['status'], 'update')
+        self.host.update(HostDevice(self.t / 'a.apk', self.files(profile_h=None)), PKG)
+        alias = re.search(rb'#define DM_GAME_MEM_ALIAS (\S+)', header)
+        if alias:
+            self.folder = self.build_folder(header.replace(alias.group(0), b'#define DM_GAME_MEM_ALIAS 0x1ull'))   # another alias region: only a port again
+            self.builds.clear(); self.refused(self.files(profile_h=None), 'another memory layout')
+        bf = self.build_folder(header); shutil.copytree(REPO / 'nxnative/dm/games' / self.BDSP, bf / 'profile-derived' / self.BDSP); self.folder = bf
+        self.builds.clear(); s = self.host.inspect(HostDevice(self.t / 'a.apk', self.files(version='v458752')), PKG)
+        self.assertEqual((s['status'], s['derived']), ('update', True))
+        self.host.update(HostDevice(self.t / 'a.apk', self.files(version='v458752')), PKG)
+        self.assertEqual(self.envs[-1].get('DM_GAMES_DIR'), str(bf / 'profile-derived'))   # the host is built from the derived profile
 
 
 if __name__ == '__main__':

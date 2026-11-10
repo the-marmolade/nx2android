@@ -1,10 +1,11 @@
-# The nx2android desktop app: four tabs over porter.
+# The nx2android desktop app: five tabs over porter.
 #   Port   pick the game folder (porter inspect), options, Port (porter port --progress json): the stage list, the current stage's bar, the log; then open or install the result
 #   Setup  the tools a port needs (porter doctor), downloading the missing ones (porter tools --download), and the saved settings (porter.config): prod.keys, the NDK,
 #          dotnet, adb, the output folder, the device
 #   Games  the game profiles (porter profiles --all)
 #   Saves  a ported game's save between the device and the PC (porter saves): the save folders on the device, a fresh export to a folder here, an import of a
 #          folder or .zip (a console's save, or an export)
+#   Updates  the ported games on the device (porter updates) and, for each, an update to this version's host in place (porter host): the saves and data stay
 import os, subprocess, sys, time
 from pathlib import Path
 
@@ -510,13 +511,110 @@ class SavesTab(QWidget):
         call_json(self, ['saves', 'import', src, '--package', self.pkg(), '--json'], self.done('the import'))
 
 
+# ---------------- Updates ----------------
+UPDATE_STATUS = {   # porter host inspect's status: the words, their colour, the row's button
+    'current': ('Up to date', '#2e7d32', None),
+    'update': ('Update available', '#1565c0', 'Update'),
+    'risky': ('Update (rewriter changed)', '#ef6c00', 'Update anyway…'),
+    'folder': ('Locate its game folder', '#ef6c00', 'Browse…'),
+    'port': ('Port again', '#c62828', None),
+}
+
+
+class UpdatesTab(QWidget):
+    """The ported games on the device (porter updates) and, for each, whether its host can be brought to this version without the game's files (porter host)"""
+    def __init__(self):
+        super().__init__()
+        self.rows, self.folders, self.queue, self.busy, self.loaded = [], {}, [], False, False
+        v = QVBoxLayout(self)
+        lab = QLabel('The games ported to the connected device, and whether each can take this version of nx2android in place: its engine (libdmhost.so) is built again '
+                     'and swapped into the installed app, signed with the same key. <b>The saves, settings and game data on the device stay.</b> '
+                     'A game whose code rewriter changed since its port can still be updated, but porting it again is the safe way.')
+        lab.setWordWrap(True); lab.setTextFormat(Qt.RichText); v.addWidget(lab)
+        row = QHBoxLayout(); self.version = QLabel(''); self.b_all = QPushButton('Update all available'); self.b_all.clicked.connect(self.update_all)
+        self.b_refresh = QPushButton('Refresh'); self.b_refresh.clicked.connect(self.refresh)
+        row.addWidget(self.version, 1); row.addWidget(self.b_all); row.addWidget(self.b_refresh); v.addLayout(row)
+        self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(['Game', 'Game version', 'Built from', 'Status', ''])
+        self.table.verticalHeader().setVisible(False); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionMode(QTableWidget.NoSelection)
+        hh = self.table.horizontalHeader(); hh.setSectionResizeMode(0, QHeaderView.Stretch); self.table.setTextElideMode(Qt.ElideMiddle)
+        for c in (1, 3, 4): hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.Interactive); self.table.setColumnWidth(2, 190)   # a version such as v0.3.0-179-g78dd993-dirty, elided; its tooltip has it whole
+        v.addWidget(self.table, 1)
+        self.status = QLabel(''); self.status.setWordWrap(True); v.addWidget(self.status)
+
+    def showEvent(self, e):   # the device is looked at when the tab is first opened, not at start-up
+        super().showEvent(e)
+        if not self.loaded: self.loaded = True; self.refresh()
+
+    def set_busy(self, msg):
+        self.busy = bool(msg)
+        if msg: self.status.setText(msg)
+        self.b_refresh.setEnabled(not self.busy)
+        self.b_all.setEnabled(not self.busy and any(r.get('status') == 'update' for r in self.rows))
+        for i in range(self.table.rowCount()):
+            w = self.table.cellWidget(i, 4)
+            if w: w.setEnabled(not self.busy)
+
+    def refresh(self):
+        args = ['updates', '--json'] + [a for t, f in self.folders.items() for a in ('--folder', f'{t}={f}')]
+        def got(res, code):
+            self.set_busy(None)
+            if not isinstance(res, dict) or 'games' not in res:
+                self.rows = []; self.table.setRowCount(0); self.status.setText(f'[RED] {(res or {}).get("error", "no device found: connect it with USB debugging on")}'); self.set_busy(None); return
+            self.version.setText(f'This version: <b>{res["version"]}</b>'); self.version.setTextFormat(Qt.RichText)
+            self.fill(res['games'])
+            n = sum(r['status'] == 'update' for r in self.rows)
+            self.status.setText('No ported game on the device.' if not self.rows else f'{len(self.rows)} ported game(s) on the device; {n} ready to update.')
+            self.set_busy(None)
+        self.set_busy('looking at the games on the device…'); call_json(self, args, got)
+
+    def fill(self, rows):
+        self.rows = sorted(rows, key=lambda r: (r.get('name') or '').lower())
+        self.table.setRowCount(len(self.rows))
+        for i, r in enumerate(self.rows):
+            word, colour, action = UPDATE_STATUS.get(r.get('status'), (r.get('status', '?'), '#000', None))
+            st = QTableWidgetItem(word); st.setForeground(QColor(colour)); st.setToolTip(r.get('reason') or word)
+            name = QTableWidgetItem(r.get('name') or r['package']); name.setToolTip(f'{r["package"]}' + (f'\nbuild folder: {r["folder"]}' if r.get('folder') else ''))
+            built = QTableWidgetItem(r.get('installed') or 'before update tracking'); built.setToolTip(built.text())
+            cells = (name, QTableWidgetItem(r.get('display', '')), built, st)
+            for j, it in enumerate(cells): self.table.setItem(i, j, it)
+            if action:
+                b = QPushButton(action); b.clicked.connect(lambda _=False, r=r: self.act(r)); self.table.setCellWidget(i, 4, b)
+            else: self.table.removeCellWidget(i, 4)
+
+    def act(self, r):
+        s = r['status']
+        if s == 'folder':
+            d = QFileDialog.getExistingDirectory(self, f'{r.get("name")}: its game folder (or its {r.get("title_id", "")}_build folder)')
+            if d: self.folders[r['title_id']] = d; self.refresh()
+            return
+        if s == 'risky' and QMessageBox.question(self, 'Update anyway?', f'{r.get("name")}: {r.get("reason")}.\n\nThe update keeps the game\'s rewritten code from its port and '
+                                                 'swaps in only the new engine. If the game misbehaves afterwards, port it again from its files. Update anyway?') != QMessageBox.Yes: return
+        self.queue = [r]; self.next()
+
+    def update_all(self):
+        self.queue = [r for r in self.rows if r['status'] == 'update']; self.next()
+
+    def next(self):
+        if not self.queue: self.refresh(); return
+        r = self.queue.pop(0)
+        args = ['host', '--package', r['package'], '--json'] + (['--folder', r['folder']] if r.get('folder') else []) + (['--force'] if r['status'] == 'risky' else [])
+        def got(res, code):
+            if code or not isinstance(res, dict) or res.get('error'):
+                self.queue = []; self.set_busy(None); self.status.setText(f'[RED] {r.get("name")}: {(res or {}).get("error", "the update failed")}'); return
+            self.status.setText(f'{r.get("name")}: updated to {res.get("version")} ({size(res.get("host", 0))} engine). Its saves and data are unchanged.')
+            self.next()
+        self.set_busy(f'updating {r.get("name")}: building its engine and installing it (a minute or two)…'); call_json(self, args, got)
+
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('nx2android'); self.resize(980, 820)
         self.tabs = QTabWidget()
-        self.port = PortTab(self); self.setup = SetupTab(self); self.games = GamesTab(); self.saves = SavesTab()
+        self.port = PortTab(self); self.setup = SetupTab(self); self.games = GamesTab(); self.saves = SavesTab(); self.updates = UpdatesTab()
         self.tabs.addTab(self.port, 'Port'); self.tabs.addTab(self.setup, 'Setup'); self.tabs.addTab(self.games, 'Games'); self.tabs.addTab(self.saves, 'Saves')
+        self.tabs.addTab(self.updates, 'Updates')
         self.setCentralWidget(self.tabs)
         self.first = True
 
