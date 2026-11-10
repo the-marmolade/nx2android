@@ -63,6 +63,8 @@ static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a;
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *env, jclass cls, jobject surface) {
     (void)cls;
     ANativeWindow *next = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
+    pthread_mutex_lock(&g_win_mu); int same = next && next == g_external_win; pthread_mutex_unlock(&g_win_mu);
+    if (same) { ANativeWindow_release(next); return; }   // the same surface reported again (Android does, 70 ms after the first): its swapchain stays
     pthread_mutex_lock(&g_win_mu); ANativeWindow *old = g_external_win; g_external_win = next; atomic_fetch_add(&g_external_epoch, 1); atomic_store(&g_external_active, next != NULL); pthread_mutex_unlock(&g_win_mu);
     vk_window_lost();
     if (old) ANativeWindow_release(old);

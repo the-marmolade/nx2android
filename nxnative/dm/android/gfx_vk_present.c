@@ -112,6 +112,7 @@ static void rot_drop_image(void) {
     if (g_rot.mem) vkFreeMemory(V.dev, g_rot.mem, NULL);
     g_rot.view = VK_NULL_HANDLE; g_rot.img = VK_NULL_HANDLE; g_rot.mem = VK_NULL_HANDLE;
 }
+static const char *g_swap_why = "first";   // what made the last swapchain go (the swapchain line says it)
 static void swap_destroy(void) {
     pace_reset();
     present_time_reset();
@@ -179,10 +180,10 @@ static int rot_setup(void) {
 }
 static int swap_make(void) {
     ANativeWindow *w = dm_front_window();
-    if (w != g_win) { swap_destroy(); g_win = w; }
+    if (w != g_win) { g_swap_why = "another window"; swap_destroy(); g_win = w; }
     if (!w) return 0;
     int ww = ANativeWindow_getWidth(w), wh = ANativeWindow_getHeight(w);
-    if (g_swap && ww > 0 && wh > 0 && ((uint32_t)ww != g_sext.width || (uint32_t)wh != g_sext.height)) swap_destroy();
+    if (g_swap && ww > 0 && wh > 0 && ((uint32_t)ww != g_sext.width || (uint32_t)wh != g_sext.height)) { g_swap_why = "the window resized"; swap_destroy(); }
     if (g_swap) return 1;
     VkAndroidSurfaceCreateInfoKHR si = {VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, NULL, 0, w};
     if (vkCreateAndroidSurfaceKHR(V.inst, &si, NULL, &g_surf)) return 0;
@@ -194,7 +195,9 @@ static int swap_make(void) {
     g_sext = (VkExtent2D){(uint32_t)ANativeWindow_getWidth(w), (uint32_t)ANativeWindow_getHeight(w)};   // the window as it is now; Android's compositor rotates (identity transform)
     if (!g_sext.width || !g_sext.height) g_sext = caps.currentExtent;
     uint32_t n = caps.minImageCount < 3 ? 3 : caps.minImageCount; if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount;
-    int want = 1; { const char *e = getenv("DM_VK_PRETRANSFORM"); if (e && *e) want = atoi(e) != 0; }
+    // pre-rotation for the device's own panel only: a television is landscape, and its surface first reports the device panel's turn (ROTATE_90 on the AYN
+    // Thor) and then none, 70 ms later, so a pre-rotated swapchain made for the first was made again for the second
+    int want = !dm_external_active(); { const char *e = getenv("DM_VK_PRETRANSFORM"); if (e && *e) want = atoi(e) != 0; }
     VkSurfaceTransformFlagBitsKHR turn = (VkSurfaceTransformFlagBitsKHR)(caps.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR));
     g_pre = want && turn && (caps.supportedTransforms & turn) && V.has_dynrender && rot_setup() ? turn : VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     g_next = g_pre == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ? g_sext : (VkExtent2D){g_sext.height, g_sext.width};
@@ -214,8 +217,8 @@ static int swap_make(void) {
             VkFenceCreateInfo f = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT}; VKCHK(vkCreateFence(V.dev, &f, NULL, &g_pfence[i]));
         }
     }
-    if (g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) VKLOG("swapchain %ux%u format %d, %u images, pre-rotated (transform %#x; the window %ux%u)", g_next.width, g_next.height, g_sfmt, g_nsimg, (unsigned)g_pre, g_sext.width, g_sext.height);
-    else VKLOG("swapchain %ux%u format %d, %u images%s", g_sext.width, g_sext.height, g_sfmt, g_nsimg, turn ? " (the compositor turns the picture)" : "");
+    if (g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) VKLOG("swapchain %ux%u format %d, %u images, pre-rotated (transform %#x; the window %ux%u; %s)", g_next.width, g_next.height, g_sfmt, g_nsimg, (unsigned)g_pre, g_sext.width, g_sext.height, g_swap_why);
+    else VKLOG("swapchain %ux%u format %d, %u images%s (%s)", g_sext.width, g_sext.height, g_sfmt, g_nsimg, turn ? " (the compositor turns the picture)" : "", g_swap_why);
     return 1;
 }
 static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to) {
@@ -1324,9 +1327,9 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
     VkFormat want = !im ? g_want : im->fmt == VK_FORMAT_R8G8B8A8_SRGB || im->fmt == VK_FORMAT_B8G8R8A8_SRGB || im->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;   // (no image: the shader prewarm's screen)
-    if (want != g_want) { g_want = want; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
+    if (want != g_want) { g_want = want; g_swap_why = "the picture's format"; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { g_swap_why = "out of date at acquire"; swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
     if (r < 0) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d", r); return; }
     vkResetFences(V.dev, 1, &g_pfence[k]);
     int turned = g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;   // composed into g_rot.img, then copied turned into the swapchain image
@@ -1403,10 +1406,10 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     r = vkQueuePresentKHR(V.q, &pi);
     if (V.has_dtiming && r >= 0) present_time_map(ptm.presentID, ticket);
     pthread_mutex_unlock(&g_vk_queue_mu);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy();
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) { g_swap_why = "out of date at present"; swap_destroy(); }
     else if (r == VK_SUBOPTIMAL_KHR && g_pre != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {   // the device turned over (ROTATE_90 <-> ROTATE_270): a swapchain for the new turn
         VkSurfaceCapabilitiesKHR c; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, g_surf, &c);
-        if ((c.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) != (VkSurfaceTransformFlagsKHR)g_pre) swap_destroy();
+        if ((c.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) != (VkSurfaceTransformFlagsKHR)g_pre) { g_swap_why = "the device turned"; swap_destroy(); }
     }
 }
 // headless frame shots
@@ -1440,7 +1443,7 @@ static void shot(vkimg_t *im, uint64_t n) {
     VKLOG("frame %llu written to %s (%ux%u)", (unsigned long long)n, path, w, h);
 }
 static pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // the swapchain against the window going away (vk_window_lost, on the main thread)
-void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
+void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); g_swap_why = "window handed over"; swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
 // The present thread: mtl_present only queues the frame and returns (as on Apple), so the game thread never waits in vkAcquireNextImageKHR or on the
 // swapchain's fences (a FIFO swapchain blocks there until a vsync); the window texture is not drawn again before its blit, because NVN's acquire waits for
 // its ticket (mtl_present_wait), and the blit's submission comes after the frame's own on the one queue. DM_VK_SYNC_PRESENT=1 presents on the game thread.
