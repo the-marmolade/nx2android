@@ -10,6 +10,7 @@ import android.view.Display;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.WindowManager;
 
 /** Routes an optional presentation surface to the host; all calls run on the UI thread. */
 public final class ExternalDisplay implements DisplayManager.DisplayListener {
@@ -54,10 +55,45 @@ public final class ExternalDisplay implements DisplayManager.DisplayListener {
         if (old != null) old.dismiss();
     }
 
+    /** A screen built into the device. A handheld with two (the AYN Thor: "Screen-2", 1080x1240, below the main one) lists the second as a presentation display too,
+     *  and the game must not move there: only a display that was plugged in or cast to counts. Display.getType() is hidden (TYPE_INTERNAL = 1); where the platform
+     *  refuses it, the names Android gives its built-in screens decide. */
+    public static boolean builtIn(Display d) {
+        try {
+            Object type = Display.class.getMethod("getType").invoke(d);
+            if (type instanceof Integer) return (Integer) type == 1;
+        } catch (Throwable e) { /* the name below */ }
+        String name = d.getName();
+        return name != null && (name.startsWith("Built-in") || name.matches("Screen-\\d+"));
+    }
+
+    /** The display's mode for the game: the most pixels (a 4K television's 3840x2160 rather than the 1080p it may start in), and at that size the refresh rate nearest
+     *  60 Hz from above, which the game's 60 and 30 fps divide. Null when the display lists none. */
+    public static Display.Mode bestMode(Display d) {
+        Display.Mode best = null; long area = -1; float rate = 0;
+        for (Display.Mode m : d.getSupportedModes()) {
+            long a = (long) m.getPhysicalWidth() * m.getPhysicalHeight(); float r = m.getRefreshRate();
+            boolean better = a > area || (a == area && (rate < 59.5f ? r > rate : r >= 59.5f && r < rate));
+            if (better) { best = m; area = a; rate = r; }
+        }
+        return best;
+    }
+
+    /** The external display the game goes to: none of the built-in screens, and the one with the most pixels when several are connected. */
+    public static Display pick(Display[] candidates) {
+        Display best = null; long area = -1;
+        for (Display d : candidates) {
+            if (builtIn(d)) continue;
+            Display.Mode m = bestMode(d);
+            long a = m == null ? 0 : (long) m.getPhysicalWidth() * m.getPhysicalHeight();
+            if (a > area) { best = d; area = a; }
+        }
+        return best;
+    }
+
     private void update() {
         if (!active) return;
-        Display[] candidates = displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
-        Display selected = candidates.length == 0 ? null : candidates[0];
+        Display selected = pick(displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION));
         if (selected == null) { dismiss(); return; }
         if (presentation != null && selected.getDisplayId() == displayId) return;
         dismiss();
@@ -77,6 +113,12 @@ public final class ExternalDisplay implements DisplayManager.DisplayListener {
             }
         });
         next.setContentView(view);
+        Display.Mode mode = bestMode(selected);   // the television's own resolution: Android mirrors at the mode it found, often 1080p
+        if (mode != null && next.getWindow() != null) {
+            WindowManager.LayoutParams lp = next.getWindow().getAttributes();
+            lp.preferredDisplayModeId = mode.getModeId();
+            next.getWindow().setAttributes(lp);
+        }
         presentation = next;
         displayId = selected.getDisplayId();
         try { next.show(); }

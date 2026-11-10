@@ -14,11 +14,19 @@ STUBS = {
     'android/app/Activity.java': '''package android.app; public class Activity extends android.content.Context { public final android.hardware.display.DisplayManager manager = new android.hardware.display.DisplayManager(); @Override public Object getSystemService(String n) { return manager; } }''',
     'android/os/Looper.java': '''package android.os; public class Looper { public static Looper getMainLooper() { return new Looper(); } }''',
     'android/os/Handler.java': '''package android.os; public class Handler { public Handler(Looper l) {} }''',
-    'android/view/Display.java': '''package android.view; public class Display { public static final int INVALID_DISPLAY=-1; private final int id; public Display(int i) { id=i; } public int getDisplayId() { return id; } }''',
+    'android/view/Display.java': '''package android.view; public class Display { public static final int INVALID_DISPLAY=-1; private final int id, type; private final String name; private final Mode[] modes;
+ public Display(int i) { this(i, 2, "HDMI Screen", new Mode(1, 1920, 1080, 60f)); }
+ public Display(int i, int t, String n, Mode... m) { id=i; type=t; name=n; modes=m; }
+ public int getDisplayId() { return id; } public String getName() { return name; } public Mode[] getSupportedModes() { return modes; }
+ public int getType() { if (type < 0) throw new SecurityException("hidden"); return type; }
+ public static class Mode { private final int id, w, h; private final float hz; public Mode(int i, int w, int h, float hz) { id=i; this.w=w; this.h=h; this.hz=hz; }
+  public int getModeId() { return id; } public int getPhysicalWidth() { return w; } public int getPhysicalHeight() { return h; } public float getRefreshRate() { return hz; } } }''',
+    'android/view/WindowManager.java': '''package android.view; public interface WindowManager { class LayoutParams { public int preferredDisplayModeId; } }''',
+    'android/view/Window.java': '''package android.view; public class Window { public static int lastMode; private final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(); public WindowManager.LayoutParams getAttributes() { return lp; } public void setAttributes(WindowManager.LayoutParams a) { lastMode = a.preferredDisplayModeId; } }''',
     'android/view/Surface.java': '''package android.view; public class Surface {}''',
     'android/view/SurfaceHolder.java': '''package android.view; public interface SurfaceHolder { Surface getSurface(); void addCallback(Callback c); interface Callback { void surfaceCreated(SurfaceHolder h); void surfaceChanged(SurfaceHolder h,int format,int w,int height); void surfaceDestroyed(SurfaceHolder h); } }''',
     'android/view/SurfaceView.java': '''package android.view; public class SurfaceView { public static Holder last; public SurfaceView(android.content.Context c) { last=new Holder(); } public SurfaceHolder getHolder(){ return last; } public static class Holder implements SurfaceHolder { public Callback cb; public final Surface surface=new Surface(); public Surface getSurface(){return surface;} public void addCallback(Callback c){cb=c;} } }''',
-    'android/app/Presentation.java': '''package android.app; public class Presentation { public static boolean fail; public Presentation(Activity a,android.view.Display d){} public android.content.Context getContext(){return new android.content.Context();} public void setContentView(android.view.SurfaceView v){} public void show(){if(fail)throw new RuntimeException();} public void dismiss(){} }''',
+    'android/app/Presentation.java': '''package android.app; public class Presentation { public static boolean fail; public static android.view.Display last; private final android.view.Window w = new android.view.Window(); public Presentation(Activity a,android.view.Display d){ last=d; } public android.view.Window getWindow(){ return w; } public android.content.Context getContext(){return new android.content.Context();} public void setContentView(android.view.SurfaceView v){} public void show(){if(fail)throw new RuntimeException();} public void dismiss(){} }''',
     'android/hardware/display/DisplayManager.java': '''package android.hardware.display; public class DisplayManager { public static final String DISPLAY_CATEGORY_PRESENTATION="presentation"; public android.view.Display[] displays={}; public int registrations; public interface DisplayListener { void onDisplayAdded(int i); void onDisplayRemoved(int i); void onDisplayChanged(int i); } public void registerDisplayListener(DisplayListener l,android.os.Handler h){registrations++;} public void unregisterDisplayListener(DisplayListener l){registrations--;} public android.view.Display[] getDisplays(String c){return displays;} }''',
     'Check.java': '''import org.nx2a.ExternalDisplay; import android.app.*; import android.view.*;
 public class Check {
@@ -32,6 +40,18 @@ public class Check {
   SurfaceView.Holder fresh=SurfaceView.last; fresh.cb.surfaceChanged(fresh,0,1920,1080); d.stop(); d.stop();
   if(events[0]!=2||events[1]!=2||a.manager.registrations!=0)throw new AssertionError("stop");
   Presentation.fail=true; d.start(); d.stop(); if(a.manager.registrations!=0)throw new AssertionError("failure");
+  Presentation.fail=false;
+  // a second built-in screen (the AYN Thor's lower one) is never taken: by its type, or by its name where the platform hides the type
+  Display lower=new Display(4, 1, "Screen-2", new Display.Mode(3, 1080, 1240, 120f), new Display.Mode(4, 1080, 1240, 60f));
+  Display hidden=new Display(4, -1, "Screen-2", new Display.Mode(3, 1080, 1240, 120f));
+  if(ExternalDisplay.pick(new Display[]{lower})!=null||ExternalDisplay.pick(new Display[]{hidden})!=null)throw new AssertionError("built-in taken");
+  Presentation.last=null; a.manager.displays=new Display[]{lower}; d.start(); if(Presentation.last!=null)throw new AssertionError("presented on the built-in screen"); d.stop();
+  // a 4K television beside it: the television, in its 3840x2160 mode at 60 Hz (not the 1080p mode it starts in, nor 4K at 30)
+  Display tv=new Display(9, 2, "HDMI Screen", new Display.Mode(11, 1920, 1080, 60f), new Display.Mode(12, 3840, 2160, 30f), new Display.Mode(13, 3840, 2160, 60f), new Display.Mode(14, 3840, 2160, 120f));
+  Display small=new Display(10, -1, "Cast", new Display.Mode(21, 1280, 720, 60f));
+  if(ExternalDisplay.pick(new Display[]{lower, small, tv})!=tv)throw new AssertionError("pick");
+  if(ExternalDisplay.bestMode(tv).getModeId()!=13)throw new AssertionError("mode " + ExternalDisplay.bestMode(tv).getModeId());
+  a.manager.displays=new Display[]{lower, tv}; d.start(); if(Presentation.last!=tv||Window.lastMode!=13)throw new AssertionError("television mode"); d.stop();
  }
 }''',
 }
