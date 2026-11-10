@@ -37,7 +37,18 @@ def _sdk_roots():   # Android SDK folders that may hold ndk/<version> and platfo
     if os.name == 'nt': out.append(os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'))
     elif sys.platform == 'darwin': out.append(os.path.expanduser('~/Library/Android/sdk'))
     else: out.append(os.path.expanduser('~/Android/Sdk'))
+    out += [str(t / 'android-sdk') for t in (LOCAL_TOOLS, player_tools())]   # one put in the nx2android folder (sdkmanager --sdk_root): --external-display's platform and build-tools
     return [Path(p) for p in out if p]
+
+
+def find_javac():   # the Java compiler --external-display builds its activity with: on PATH, JAVA_HOME's, else a JDK in the nx2android folder (jdk-*)
+    c = shutil.which('javac')
+    if c: return c
+    homes = [os.environ.get('JAVA_HOME')] + [p for t in (LOCAL_TOOLS, player_tools()) for p in sorted(glob.glob(str(t / 'jdk-*')), reverse=True)]
+    for h in filter(None, homes):
+        f = Path(h) / 'bin' / f'javac{EXE}'
+        if f.is_file(): return str(f)
+    return None
 
 
 def ndk_revision(d):   # Pkg.Revision from an NDK folder's source.properties, None when it is not an NDK

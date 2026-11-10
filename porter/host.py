@@ -290,7 +290,14 @@ def update(adb, package, jobs=os.cpu_count() or 8, folder='', force=False):
         adb.run('pull', installed_apk(adb, package), src, timeout=600)
         from porter.pipeline import ui_font_assets   # the overlay's font: an APK ported before it came has none, and the new host looks for it
         fonts = [a for n, f in ui_font_assets().items() for a in ('--asset', f'{n}={f}')]
-        r = subprocess.run([sys.executable, str(DM / 'android/apk/apkdriver.py'), str(src), str(out), str(paths.signing_key()), '--host', str(so)] + fonts,
+        tv_dex = []   # an app in TV mode (porter tv): its external-display activity is built again too, so it matches the new host
+        import zipfile
+        with zipfile.ZipFile(src) as z: has_dex = 'classes.dex' in z.namelist()
+        if has_dex:
+            from porter import tv
+            try: tv_dex = ['--external-dex', str(tv.build_dex(Path(t) / 'java'))]
+            except BuildError as e: say(f'[RED] {package}: its TV-mode activity stays as it is ({e})')
+        r = subprocess.run([sys.executable, str(DM / 'android/apk/apkdriver.py'), str(src), str(out), str(paths.signing_key()), '--host', str(so)] + fonts + tv_dex,
                            capture_output=True, text=True, errors='replace')
         if r.returncode: raise BuildError((r.stderr.strip() or r.stdout.strip()).splitlines()[-1])
         size = so.stat().st_size

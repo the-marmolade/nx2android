@@ -351,5 +351,52 @@ class DriverSetTest(unittest.TestCase):   # porter drivers (the GUI's Drivers wi
         self.assertTrue(driver.current(dev, PKG)['loader'])
 
 
+class TvTest(unittest.TestCase):   # porter tv: the external-display activity put in an installed port's APK and taken out again, its manifest patched in place
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp(prefix='nx2a_tv_test_')); self.addCleanup(shutil.rmtree, self.t, ignore_errors=True)
+        so = self.t / 'libdmhost.so'; so.write_bytes(b'\x7fELF' + b'\0' * 60)
+        subprocess.run([sys.executable, str(APK / 'mkapk.py'), str(so), str(self.t / 'a.apk'), str(paths.signing_key()), '--lib', 'dmhost', '--release', '--landscape'], check=True, capture_output=True)
+        sys.path.insert(0, str(APK)); self.addCleanup(sys.path.remove, str(APK))
+        import apkdriver; self.tool = apkdriver
+
+    def manifest(self, apk):
+        with zipfile.ZipFile(apk) as z: return z.read('AndroidManifest.xml'), z.namelist()
+
+    def test_manifest(self):
+        m, names = self.manifest(self.t / 'a.apk')
+        self.assertEqual(self.tool.manifest_activity(m), 'android.app.NativeActivity'); self.assertNotIn('classes.dex', names)
+        on = self.tool.manifest_with_activity(m, self.tool.EXTERNAL)
+        self.assertEqual(self.tool.manifest_activity(on), 'org.nx2a.ExternalActivity'); self.assertEqual(int.from_bytes(on[4:8], 'little'), len(on))   # the file chunk's size
+        self.assertEqual(self.tool.manifest_with_activity(on, self.tool.NATIVE), m)   # and back: the manifest mkapk.py wrote, byte for byte
+        # the same manifest mkapk.py writes for a port made with --external-display (--dex, --activity)
+        dex = self.t / 'classes.dex'; dex.write_bytes(b'dex\n035\0' + b'\0' * 32)
+        so = self.t / 'libdmhost.so'
+        subprocess.run([sys.executable, str(APK / 'mkapk.py'), str(so), str(self.t / 'e.apk'), str(paths.signing_key()), '--lib', 'dmhost', '--release', '--landscape',
+                        '--dex', str(dex), '--activity', 'org.nx2a.ExternalActivity'], check=True, capture_output=True)
+        want, _ = self.manifest(self.t / 'e.apk')
+        self.assertEqual(on, want)
+
+    def test_porter_tv(self):
+        from unittest import mock
+        from porter import tv
+        dev = SetDevice(self.t / 'a.apk', {})
+        dev.resolve = lambda: self.tool.manifest_activity(self.manifest(dev.apk)[0])
+        real = dev.run
+        def run(*a, **kw):
+            if a[0] == 'shell' and str(a[1]).startswith('cmd package resolve-activity'): return f'priority=0\n{PKG}/{dev.resolve()}\n'
+            return real(*a, **kw)
+        dev.run = run
+        self.assertFalse(tv.status(dev, PKG)['tv'])
+        def fake_dex(out):
+            out = Path(out); out.mkdir(parents=True, exist_ok=True); (out / 'classes.dex').write_bytes(b'dex\n035\0the activity'); return out / 'classes.dex'
+        with mock.patch.object(tv, 'build_dex', side_effect=fake_dex):
+            self.assertTrue(tv.set_mode(dev, PKG, True)['tv'])
+        m, names = self.manifest(dev.apk); self.assertIn('classes.dex', names); self.assertTrue(tv.status(dev, PKG)['tv'])
+        with zipfile.ZipFile(dev.apk) as z: self.assertEqual(z.read('classes.dex'), b'dex\n035\0the activity')
+        self.assertIn('libdmhost.so', libs(dev.apk))   # still signed, its library on a page boundary
+        self.assertFalse(tv.set_mode(dev, PKG, False)['tv'])
+        m, names = self.manifest(dev.apk); self.assertNotIn('classes.dex', names); self.assertFalse(tv.status(dev, PKG)['tv'])
+
+
 if __name__ == '__main__':
     unittest.main()

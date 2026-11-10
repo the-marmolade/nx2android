@@ -94,6 +94,9 @@ def _parser():
     up.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)')
     up.add_argument('--folder', action='append', default=[], metavar='TITLEID=FOLDER', help="a game's build folder (see porter host --folder); may repeat")
     up.add_argument('--json', action='store_true')
+    tvp = sub.add_parser('tv', help='TV mode for a port on the device, without the game files: with a display plugged in, the game shows there in the display\'s own mode and the device is the gamepad')
+    tvp.add_argument('mode', choices=('on', 'off', 'status'))
+    tvp.add_argument('--package', default='', help='the app (default: the only ported game installed)'); tvp.add_argument('--device', default='', help='adb serial'); tvp.add_argument('--json', action='store_true')
     dv = sub.add_parser('drivers', help="a port's Vulkan drivers (up to three, the pause menu's Driver tab), changed without the game files: the saves and data stay")
     dvs = dv.add_subparsers(dest='drivers_cmd', required=True)
     d1 = dvs.add_parser('list', help="the drivers the app carries and its default"); d2 = dvs.add_parser('file', help='what a driver file (.zip or .so) holds')
@@ -284,12 +287,14 @@ def cmd_saves(a):
 
 def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt without the game files
     import contextlib
-    from porter import config, driver, host, saves, toolchain
+    from porter import config, driver, host, saves, toolchain, tv
     from porter.upstream import BuildError
     try:
         with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):   # with --json, stdout is the one JSON document
             cfg = config.load(); adb = saves.connect(toolchain.find_adb(cfg), a.device or cfg.get('device'))
             if a.cmd == 'driver': out = driver.swap(adb, saves.pick_app(adb, a.package), None if a.system else a.library)
+            elif a.cmd == 'tv':
+                pkg = saves.pick_app(adb, a.package); out = tv.status(adb, pkg) if a.mode == 'status' else tv.set_mode(adb, pkg, a.mode == 'on')
             elif a.cmd == 'host': out = host.update(adb, saves.pick_app(adb, a.package), a.jobs, folder=a.folder, force=a.force)
             else:   # updates
                 folders = {k.upper(): v for k, v in (f.split('=', 1) for f in a.folder if '=' in f)}
@@ -299,12 +304,15 @@ def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt 
                         r = host.inspect(adb, pkg)
                         if r.get('title_id') in folders: r = host.inspect(adb, pkg, folders[r['title_id']])
                     except BuildError as e: r = {'package': pkg, 'name': pkg, 'status': 'port', 'reason': str(e)}
+                    try: r['tv'] = tv.status(adb, pkg)['tv']
+                    except BuildError: r['tv'] = False
                     out['games'].append(r)
     except BuildError as e:
         if a.json: _print_json({'error': str(e)})
         else: print(e, file=sys.stderr)
         return 1
     if a.json: _print_json(out)
+    elif a.cmd == 'tv': print(f'{out["package"]}: TV mode ' + ('on' if out['tv'] else 'off'))
     elif a.cmd == 'updates':
         print(f'this version: {out["version"]}')
         for g in out['games']:
@@ -356,4 +364,4 @@ STATUS_WORD = {'current': 'up to date', 'update': 'update available', 'risky': '
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver, 'drivers': cmd_drivers}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver, 'tv': cmd_driver, 'drivers': cmd_drivers}[a.cmd](a)

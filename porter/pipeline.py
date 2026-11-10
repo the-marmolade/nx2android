@@ -785,7 +785,7 @@ class Port:
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
 
     def external_activity(self):
-        javac = shutil.which('javac')
+        javac = toolchain.find_javac()   # on PATH, JAVA_HOME's, or the nx2android folder's JDK
         roots = toolchain._sdk_roots()
         platforms = [p for root in roots for p in (root / 'platforms').glob('android-*/android.jar')]
         d8s = [p for root in roots for p in (root / 'build-tools').glob('*/d8' + ('.bat' if os.name == 'nt' else ''))]
@@ -796,8 +796,10 @@ class Port:
         out = self.aw / 'external-activity'; classes, dex = out / 'classes', out / 'dex'
         shutil.rmtree(out, ignore_errors=True); classes.mkdir(parents=True); dex.mkdir()
         sources = sorted((DM / 'android/java/org/nx2a').glob('*.java'))
-        nsp.run([javac, '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_external_java.log', env=self.env)
-        nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_external_dex.log', env=self.env)
+        nsp.run([javac, '-encoding', 'UTF-8', '-source', '8', '-target', '8', '-classpath', platform, '-d', classes, *sources], self.logs / 'android_external_java.log', env=self.env)
+        env = dict(self.env)   # d8 is a Java program: it runs with the JDK the compiler came from, not whichever java is first on PATH
+        if Path(javac).parent.name == 'bin' and Path(javac).parent.parent.is_dir(): env['JAVA_HOME'] = str(Path(javac).parent.parent)
+        nsp.run([d8, '--min-api', '29', '--lib', platform, '--output', dex, *sorted(classes.rglob('*.class'))], self.logs / 'android_external_dex.log', env=env)
         return ['--dex', dex / 'classes.dex', '--activity', 'org.nx2a.ExternalActivity']
 
     def theme(self):

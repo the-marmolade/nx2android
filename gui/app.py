@@ -85,6 +85,8 @@ class PortTab(QWidget):
                                 'An app of another package has its own saves.')
         self.fps60 = QCheckBox('60 fps (the profile\'s own frame-rate cap, else the community\'s FPSLocker-Warehouse config of the game\'s build, fetched from GitHub)')
         self.touch = QCheckBox('Touch game: start with the on-screen gamepad hidden, so every touch but the menu button\'s goes to the game (the pause menu shows it again)')   # porter port --touch
+        self.tv = QCheckBox('TV mode: with a TV or monitor plugged into the device, the game shows there in the display\'s own resolution and the device is the gamepad '
+                            '(needs a JDK and the Android SDK\'s platform and build-tools; it can also be turned on later, in the Updates tab)')   # porter port --external-display
         self.driver = QLineEdit(); self.driver.setPlaceholderText('the device\'s own')   # porter port --vulkan-driver
         self.driver.setToolTip('A Vulkan driver library (.so) to pack in the APK and use instead of the device\'s own,\n'
                                'such as Mesa\'s Turnip for Adreno GPUs. Empty: the device\'s driver.\n'
@@ -114,7 +116,7 @@ class PortTab(QWidget):
         f.addRow('Package', self.package); f.addRow('versionCode offset', self.vercode); f.addRow('Extra address space', headroom)
         f.addRow('Vulkan driver', path_row(self.driver, self.pick_driver))
         f.addRow('System font', path_row(self.shared_font, self.pick_shared_font))
-        f.addRow('', self.fps60); f.addRow('', self.touch); f.addRow('', self.mt_replay); f.addRow('', self.thor); f.addRow('', self.gpu_turbo); f.addRow('', self.debug); f.addRow('', self.experimental)
+        f.addRow('', self.fps60); f.addRow('', self.touch); f.addRow('', self.tv); f.addRow('', self.mt_replay); f.addRow('', self.thor); f.addRow('', self.gpu_turbo); f.addRow('', self.debug); f.addRow('', self.experimental)
         v.addWidget(o)
 
         bar = QHBoxLayout()
@@ -218,6 +220,7 @@ class PortTab(QWidget):
         if self.headroom.value() >= 0: args += ['--alias-headroom', str(self.headroom.value())]
         if self.fps60.isChecked(): args.append('--fps60')
         if self.touch.isChecked(): args.append('--touch')
+        if self.tv.isChecked(): args.append('--external-display')
         if self.mt_replay.isChecked(): args.append('--mt-replay')
         if self.thor.isChecked(): args += ['--preset', 'thor']
         if self.gpu_turbo.isChecked(): args.append('--gpu-turbo')
@@ -534,10 +537,10 @@ class UpdatesTab(QWidget):
         row = QHBoxLayout(); self.version = QLabel(''); self.b_all = QPushButton('Update all available'); self.b_all.clicked.connect(self.update_all)
         self.b_refresh = QPushButton('Refresh'); self.b_refresh.clicked.connect(self.refresh)
         row.addWidget(self.version, 1); row.addWidget(self.b_all); row.addWidget(self.b_refresh); v.addLayout(row)
-        self.table = QTableWidget(0, 6); self.table.setHorizontalHeaderLabels(['Game', 'Game version', 'Built from', 'Status', '', 'Drivers'])
+        self.table = QTableWidget(0, 7); self.table.setHorizontalHeaderLabels(['Game', 'Game version', 'Built from', 'Status', '', 'Drivers', 'TV mode'])
         self.table.verticalHeader().setVisible(False); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionMode(QTableWidget.NoSelection)
         hh = self.table.horizontalHeader(); hh.setSectionResizeMode(0, QHeaderView.Stretch); self.table.setTextElideMode(Qt.ElideMiddle)
-        for c in (1, 3, 4, 5): hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c in (1, 3, 4, 5, 6): hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.Interactive); self.table.setColumnWidth(2, 190)   # a version such as v0.3.0-179-g78dd993-dirty, elided; its tooltip has it whole
         v.addWidget(self.table, 1)
         self.status = QLabel(''); self.status.setWordWrap(True); v.addWidget(self.status)
@@ -552,7 +555,7 @@ class UpdatesTab(QWidget):
         self.b_refresh.setEnabled(not self.busy)
         self.b_all.setEnabled(not self.busy and any(r.get('status') == 'update' for r in self.rows))
         for i in range(self.table.rowCount()):
-            for c in (4, 5):
+            for c in (4, 5, 6):
                 w = self.table.cellWidget(i, c)
                 if w: w.setEnabled(not self.busy)
 
@@ -565,7 +568,8 @@ class UpdatesTab(QWidget):
             self.version.setText(f'This version: <b>{res["version"]}</b>'); self.version.setTextFormat(Qt.RichText)
             self.fill(res['games'])
             n = sum(r['status'] == 'update' for r in self.rows)
-            self.status.setText('No ported game on the device.' if not self.rows else f'{len(self.rows)} ported game(s) on the device; {n} ready to update.')
+            note, self.note = getattr(self, 'note', ''), ''   # what an action just did (tv), kept over the list's own line
+            self.status.setText(note or ('No ported game on the device.' if not self.rows else f'{len(self.rows)} ported game(s) on the device; {n} ready to update.'))
             self.set_busy(None)
         self.set_busy('looking at the games on the device…'); call_json(self, args, got)
 
@@ -584,6 +588,10 @@ class UpdatesTab(QWidget):
             else: self.table.removeCellWidget(i, 4)
             d = QPushButton('Drivers…'); d.setToolTip("The Vulkan drivers this game can use (the pause menu's Driver tab): add one from a file, remove one, pick the default")
             d.clicked.connect(lambda _=False, r=r: DriversDialog(self, r).exec()); self.table.setCellWidget(i, 5, d)
+            t = QPushButton('On: turn off' if r.get('tv') else 'Off: turn on')
+            t.setToolTip('TV mode: with a TV or monitor plugged into the device (HDMI or DisplayPort over USB-C), the game shows there in the display\'s own resolution '
+                         'and the device\'s screen becomes the gamepad. With nothing plugged in the game runs on the device as usual.')
+            t.clicked.connect(lambda _=False, r=r: self.tv(r)); self.table.setCellWidget(i, 6, t)
 
     def act(self, r):
         s = r['status']
@@ -594,6 +602,16 @@ class UpdatesTab(QWidget):
         if s == 'risky' and QMessageBox.question(self, 'Update anyway?', f'{r.get("name")}: {r.get("reason")}.\n\nThe update keeps the game\'s rewritten code from its port and '
                                                  'swaps in only the new engine. If the game misbehaves afterwards, port it again from its files. Update anyway?') != QMessageBox.Yes: return
         self.queue = [r]; self.next()
+
+    def tv(self, r):   # porter tv on / off: the external-display activity put in the installed app, or taken out
+        on = not r.get('tv')
+        def got(res, code):
+            self.set_busy(None)
+            if code or not isinstance(res, dict) or res.get('error'): self.status.setText(f'[RED] {r.get("name")}: {(res or {}).get("error", "TV mode could not be changed")}'); return
+            note = f'{r.get("name")}: TV mode ' + ('on. Plug a TV or monitor into the device and start the game: it shows there, and the device is the gamepad.' if res.get('tv') else 'off.')
+            self.note = note; self.refresh()
+        self.set_busy(f'{r.get("name")}: turning TV mode ' + ('on' if on else 'off') + ' (its app is rebuilt and installed; saves and data stay)…')
+        call_json(self, ['tv', 'on' if on else 'off', '--package', r['package'], '--json'], got)
 
     def update_all(self):
         self.queue = [r for r in self.rows if r['status'] == 'update']; self.next()
