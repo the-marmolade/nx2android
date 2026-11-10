@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <math.h>
 #include "dm.h"
 #include "perf_sample.h"
 
@@ -32,6 +33,7 @@ static struct {
     int (*update)(APerformanceHintSession *, int64_t);
     int (*report)(APerformanceHintSession *, int64_t);
     int (*set_threads)(APerformanceHintSession *, const int32_t *, size_t);
+    void (*close)(APerformanceHintSession *);   // Android 13: without setThreads, a session made again for the new threads (hint_threads_scan)
     // Android 15: the frame's GPU time beside its CPU time (the GPU's clock follows it too)
     int (*report2)(APerformanceHintSession *, AWorkDuration *);
     AWorkDuration *(*wd_create)(void);
@@ -67,6 +69,7 @@ static void hint_init(int64_t target) {
     H.get = dlsym(lib, "APerformanceHint_getManager"); H.create = dlsym(lib, "APerformanceHint_createSession");
     H.update = dlsym(lib, "APerformanceHint_updateTargetWorkDuration"); H.report = dlsym(lib, "APerformanceHint_reportActualWorkDuration");
     H.set_threads = dlsym(lib, "APerformanceHint_setThreads");   // Android 14
+    H.close = dlsym(lib, "APerformanceHint_closeSession");   // Android 13
     H.report2 = dlsym(lib, "APerformanceHint_reportActualWorkDuration2");   // Android 15
     H.wd_create = dlsym(lib, "AWorkDuration_create");
     H.wd_start = dlsym(lib, "AWorkDuration_setWorkPeriodStartTimestampNanos"); H.wd_total = dlsym(lib, "AWorkDuration_setActualTotalDurationNanos");
@@ -83,7 +86,8 @@ static void hint_init(int64_t target) {
 // The other threads that do frame work: the presenting thread is the game's render thread, and its main thread (the simulation) and job workers set
 // the pace as much. Every 300 frames the threads that used at least 15% of a core since the last look join the session (up to 5 besides the
 // presenting one), the ones that went idle leave it. Without them NEO's main thread ran on mid cores at 1.9 of 3.5 GHz and its bursts made
-// 45 to 80 ms frames. Needs APerformanceHint_setThreads (Android 14)
+// 45 to 80 ms frames. With APerformanceHint_setThreads (Android 14) the session takes them; on Android 13 (the AYN Thor), which has no setThreads but
+// takes several threads when a session is made, the session is made again for them (the old one closed)
 static uint64_t task_ticks(int tid) {
     char p[64], b[512]; snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
     FILE *f = fopen(p, "r"); if (!f) return 0;
@@ -102,7 +106,8 @@ static void hint_threads_scan(int32_t self) {
     closedir(d);
     int32_t pick[8]; int npick = 0; pick[npick++] = self;
     if (secs > 0) {
-        long hz = sysconf(_SC_CLK_TCK); double need = 0.15 * secs * (double)(hz > 0 ? hz : 100);
+        static double share = -1; if (share < 0) { const char *e = getenv("DM_ADPF_SHARE"); share = e && atof(e) > 0 && atof(e) < 100 ? atof(e) / 100 : 0.15; }   // (DM_ADPF_SHARE: % of a core)
+        long hz = sysconf(_SC_CLK_TCK); double need = share * secs * (double)(hz > 0 ? hz : 100);
         for (int k = 0; k < 5; k++) {   // the busiest first
             int best = -1; uint64_t bu = 0;
             for (int i = 0; i < nc; i++) {
@@ -117,10 +122,15 @@ static void hint_threads_scan(int32_t self) {
         }
     }
     np = 0; for (int i = 0; i < nc; i++) { prev[np].tid = cur[i].tid; prev[np].ticks = cur[i].used; np++; }
-    if (!g_hint || !H.set_threads) return;
+    if (!g_hint || (!H.set_threads && !H.close)) return;
     int same = npick == g_hint_n; for (int i = 0; same && i < npick; i++) { int in = 0; for (int j = 0; j < g_hint_n; j++) in |= g_hint_tids[j] == pick[i]; same = in; }
     if (same) return;
-    if (H.set_threads(g_hint, pick, (size_t)npick)) { LOG("[perf] ADPF: the session refused threads"); return; }
+    if (H.set_threads) { if (H.set_threads(g_hint, pick, (size_t)npick)) { LOG("[perf] ADPF: the session refused threads"); return; } }
+    else {   // Android 13: a new session for these threads, then the old one closed (a refused new one leaves the old in place)
+        APerformanceHintManager *m = H.get(); APerformanceHintSession *n = m ? H.create(m, pick, (size_t)npick, g_hint_target) : NULL;
+        if (!n) { static int said; if (!said++) LOG("[perf] ADPF: no session for %d threads (Android 13): the presenting thread's stays", npick); return; }
+        APerformanceHintSession *old = g_hint; g_hint = n; H.close(old);
+    }
     memcpy(g_hint_tids, pick, sizeof(int32_t) * (size_t)npick); g_hint_n = npick;
     char l[160]; size_t o = 0; for (int i = 0; i < npick; i++) o += snprintf(l + o, sizeof l - o, " %d", pick[i]);
     LOG("[perf] ADPF session threads:%s", l);
@@ -238,6 +248,94 @@ static int shown_late(void) {   // of the last 64 frames on screen, how many mis
     for (int i = 0; i < n; i++) m += g_late[i];
     return m * 64 / n;
 }
+// Thermal headroom (AThermal_getThermalHeadroom, Android 12): the share of the way to throttling the device is forecast to be in 10 s, 1.0 the point where
+// it throttles. On Auto the frame rate steps down a step before that (forecast 0.95 or more), not after the clocks fall and the frames go late; it does not
+// step back up while hot, and the device counts as cool again after 30 s under 0.80. The step-down waits 10 s after any change, so the lower rate has
+// time to show on the forecast. Android answers at most about once a second (NaN when asked sooner, or where the device has no forecast)
+static int g_hot; static float g_headroom = NAN;
+static float thermal_headroom(void) {
+    static int tried; static void *mgr; static float (*get)(void *, int);
+    if (!tried) {
+        tried = 1; void *lib = dlopen("libandroid.so", RTLD_NOW);
+        void *(*acq)(void) = lib ? (void *(*)(void))dlsym(lib, "AThermal_acquireManager") : NULL;
+        get = lib ? (float (*)(void *, int))dlsym(lib, "AThermal_getThermalHeadroom") : NULL; mgr = acq && get ? acq() : NULL;
+        if (!mgr) LOG("[perf] thermal headroom: not on this Android (AThermal_getThermalHeadroom): the frame rate steps down only when frames go late");
+    }
+    return mgr ? get(mgr, 10) : NAN;
+}
+float dm_perf_headroom(void) { return g_headroom; }   // the last forecast (NaN: none), for the HUD and a recording
+// Where Android has no forecast (the AYN Thor: its thermal HAL is not connected, dumpsys thermalservice "HAL Ready: false", so the headroom is NaN and the
+// status stays 0 however hot the chip is), one from the kernel's thermal zones: each cpu*/gpu* sensor and its lowest passive trip point (where the kernel
+// starts to throttle it: on the Thor the GPU's at 95 C, the big cores' at 108 C). The margin is the least of trip - temperature, its trend a smoothed
+// change per second; the forecast margin 10 s ahead is the margin less 10 s of a falling trend. Hot at a forecast margin of 5 C or less; cool again after
+// 30 s at 15 C or more
+static struct { char path[80]; int trip; char name[24]; } g_tz[48]; static int g_ntz = -1;
+static int zone_read(const char *path, long *v) { FILE *f = fopen(path, "r"); if (!f) return 0; int ok = fscanf(f, "%ld", v) == 1; fclose(f); return ok; }
+static void zones_init(void) {
+    g_ntz = 0;
+    for (int i = 0; i < 300 && g_ntz < 48; i++) {
+        char p[96], t[32] = {0}; snprintf(p, sizeof p, "/sys/class/thermal/thermal_zone%d/type", i); FILE *f = fopen(p, "r");
+        if (!f) { if (errno == ENOENT) break; continue; }
+        if (!fgets(t, sizeof t, f)) t[0] = 0; fclose(f); t[strcspn(t, "\n")] = 0;
+        if ((strncmp(t, "cpu", 3) && strncmp(t, "gpu", 3)) || strstr(t, "trip")) continue;
+        long trip = 0;
+        for (int k = 0; k < 8; k++) {   // the lowest passive trip point
+            char tp[112], ty[16] = {0}; long v;
+            snprintf(tp, sizeof tp, "/sys/class/thermal/thermal_zone%d/trip_point_%d_type", i, k); f = fopen(tp, "r"); if (!f) break;
+            if (!fgets(ty, sizeof ty, f)) ty[0] = 0; fclose(f);
+            snprintf(tp, sizeof tp, "/sys/class/thermal/thermal_zone%d/trip_point_%d_temp", i, k);
+            if (!strncmp(ty, "passive", 7) && zone_read(tp, &v) && v > 0 && (!trip || v < trip)) trip = v;
+        }
+        long now; snprintf(p, sizeof p, "/sys/class/thermal/thermal_zone%d/temp", i);
+        if (!trip || !zone_read(p, &now)) continue;
+        static int off = -1; if (off < 0) { const char *e = getenv("DM_THERMAL_OFFSET"); off = e && atoi(e) > 0 ? atoi(e) : 0; }   // (DM_THERMAL_OFFSET: the trips that many C lower, a test)
+        snprintf(g_tz[g_ntz].path, sizeof g_tz[0].path, "%s", p); g_tz[g_ntz].trip = (int)(trip > 1000 ? trip / 1000 : trip) - off;
+        snprintf(g_tz[g_ntz].name, sizeof g_tz[0].name, "%s", t); g_ntz++;
+    }
+    int lo = 0; for (int i = 1; i < g_ntz; i++) if (g_tz[i].trip < g_tz[lo].trip) lo = i;
+    if (g_ntz) LOG("[perf] thermal: %d sensors with throttle points, the lowest %s at %d C (the frame rate steps down before it)", g_ntz, g_tz[lo].name, g_tz[lo].trip);
+    else LOG("[perf] thermal: no readable sensors with throttle points: the frame rate steps down only when frames go late");
+}
+static int zones_margin(const char **who) {   // the least trip - temperature of the sensors, whole degrees C (1000: none read)
+    if (g_ntz < 0) zones_init();
+    int m = 1000;
+    for (int i = 0; i < g_ntz; i++) { long v; if (!zone_read(g_tz[i].path, &v)) continue; if (v > 1000) v /= 1000; int d = g_tz[i].trip - (int)v; if (d < m) { m = d; *who = g_tz[i].name; } }
+    return m;
+}
+static void thermal_step(int64_t now) {
+    static int64_t last, cool_since, logged; static int nan_n;
+    if (now - last < 1100000000ll) return;   // (Android's own limit is about a second)
+    last = now;
+    float h = thermal_headroom(); int hot, cool; char why[96];
+    if (!isnan(h) && h >= 0) {   // Android's forecast
+        g_headroom = h; hot = h >= 0.95f; cool = h < 0.80f; snprintf(why, sizeof why, "thermal headroom %.2f", h);
+        if (now - logged >= 60000000000ll) { logged = now; LOG("[perf] thermal headroom %.2f (10 s ahead; 1.00 throttles)%s", h, g_hot ? ", hot: the frame rate stays down" : ""); }
+    } else {   // the sensors' (zones_margin)
+        if (++nan_n == 5) LOG("[perf] thermal headroom: Android gives no forecast here: the chip's sensors and throttle points instead");
+        static float trend; static int prev = 1000; const char *who = "?";
+        int m = zones_margin(&who); if (m >= 1000) return;
+        if (prev < 1000) trend = trend * 0.8f + (float)(m - prev) * 0.2f;   // degrees of margin per second, smoothed (negative: heating)
+        prev = m;
+        float ahead = (float)m + (trend < 0 ? trend * 10 : 0);
+        hot = ahead <= 5; cool = m >= 15; snprintf(why, sizeof why, "%s %d C from throttling (%.0f C in 10 s)", who, m, ahead);
+        if (now - logged >= 60000000000ll) { logged = now; LOG("[perf] thermal: %s%s", why, g_hot ? ", hot: the frame rate stays down" : ""); }
+    }
+    if (hot) {
+        cool_since = 0;
+        if (!g_hot) { g_hot = 1; LOG("[perf] thermal: %s: throttling ahead", why); }
+        if (!g_adapt) return;
+        int pin = fps_pin(), menu = atomic_load(&g_menu_pin);
+        if (pin >= 0 || menu >= 0) { static int said; if (!said++) LOG("[perf] thermal: the frame rate is held (pause menu or DM_FPS_PIN): it stays as chosen"); return; }
+        int nsteps = (int)(sizeof STEPS / sizeof *STEPS);
+        if (g_step + 1 < nsteps && now - g_last_change >= 10000000000ll) {
+            g_step++; g_last_change = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0;
+            LOG("[perf] adaptive frame rate: %.0f fps (%s, ahead of throttling)", 1e9 / STEPS[g_step], why);
+        }
+    } else if (g_hot && cool) {
+        if (!cool_since) cool_since = now;
+        else if (now - cool_since >= 30000000000ll) { g_hot = 0; cool_since = 0; LOG("[perf] thermal: %s for 30 s: cool again, the frame rate may step up", why); }
+    } else cool_since = 0;
+}
 static void adapt_frame(int64_t work, int64_t now) {
     // A long frame in which the replay and the GPU did next to nothing is a load (a loading screen, the game reading files on its main thread), not a frame the
     // rate could fit: it is not judged. Hades II's room changes gave ~10 frames of 28-680 ms with 0.3-0.4 ms of GPU work, the rate stepped down to 40 fps,
@@ -268,7 +366,7 @@ static void adapt_frame(int64_t work, int64_t now) {
     // Unicorn Overlord's opening held 60 fps with 1-2 of 64 frames late, but once a load stepped it down to 40 its p90 stayed at 21-25 ms and it never went back
     // up (p50 14-15 ms). With 50 it tries the shorter period again; a try that does not fit misses the display and steps back down, and the next waits twice as long
     static int up_pct = -1; if (up_pct < 0) { const char *e = getenv("DM_ADAPT_UP_PCT"); up_pct = e && atoi(e) > 0 && atoi(e) < 100 ? atoi(e) : 90; }
-    if (g_step > 0 && (up_pct == 90 ? p90 : work_pct(up_pct)) < STEPS[g_step - 1]) { if (++g_ok_frames > 120 && now - g_last_change >= g_up_hold) { g_step--; g_last_change = g_last_up = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms)", 1e9 / STEPS[g_step], p90 / 1e6); } }
+    if (g_step > 0 && !g_hot && (up_pct == 90 ? p90 : work_pct(up_pct)) < STEPS[g_step - 1]) { if (++g_ok_frames > 120 && now - g_last_change >= g_up_hold) { g_step--; g_last_change = g_last_up = now; g_nwork = 0; g_nshown = 0; g_ok_frames = 0; LOG("[perf] adaptive frame rate: %.0f fps (frames p90 %.1f ms)", 1e9 / STEPS[g_step], p90 / 1e6); } }
     else g_ok_frames = 0;
 }
 // hle_nvn.c, the first acquire after a present, right after its pacing wait. A frame's work is the time between two presents less that wait: what the
@@ -412,6 +510,7 @@ void dm_perf_frame(double period) {
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
         int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)
+        thermal_step(t);
         if (w > 0 && w < 250000000) { adapt_frame(w - pace > 0 ? w - pace : 0, t); ll_record(w - pq > 0 ? w - pq : w); if (g_hint) hint_report(w, pq, pace, t, g_hint_target); }
         if (g_step > 0 && atomic_load(&g_menu_pin) < 0 && atomic_load(&g_container) && !atomic_exchange(&g_cont_engaged, 1))
             LOG("[perf] 120 Hz container in use: Auto stepped to %.0f fps (kept for this launch)", 1e9 / STEPS[g_step]);
