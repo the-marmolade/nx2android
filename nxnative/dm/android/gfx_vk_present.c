@@ -180,7 +180,7 @@ static int rot_setup(void) {
 }
 static int swap_make(void) {
     ANativeWindow *w = dm_front_window();
-    if (w != g_win) { g_swap_why = "another window"; swap_destroy(); g_win = w; }
+    if (w != g_win) { if (g_win) g_swap_why = "another window"; swap_destroy(); g_win = w; }   // (none before: the reason it went, kept)
     if (!w) return 0;
     int ww = ANativeWindow_getWidth(w), wh = ANativeWindow_getHeight(w);
     if (g_swap && ww > 0 && wh > 0 && ((uint32_t)ww != g_sext.width || (uint32_t)wh != g_sext.height)) { g_swap_why = "the window resized"; swap_destroy(); }

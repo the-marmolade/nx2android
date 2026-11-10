@@ -59,7 +59,9 @@ static ANativeWindow *phone_window(void) { pthread_mutex_lock(&g_win_mu); ANativ
 int dm_external_active(void) { return atomic_load(&g_external_active); }
 __attribute__((weak)) void vk_window_lost(void) {}   // the backend lets go of the window's swapchain before the window goes
 static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = w; pthread_mutex_unlock(&g_win_mu); }
-static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_win_mu); g_win = NULL; pthread_mutex_unlock(&g_win_mu); vk_window_lost(); }
+// the activity's own window going: the swapchain on it goes too, unless the game is on a television (TV mode: the device's gamepad covers the activity,
+// and Android takes its window away while the game draws to the television's, which made the television's swapchain again at each plug-in)
+static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_win_mu); g_win = NULL; int ext = g_external_win != NULL; pthread_mutex_unlock(&g_win_mu); if (!ext) vk_window_lost(); }
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalSurface(JNIEnv *env, jclass cls, jobject surface) {
     (void)cls;
     ANativeWindow *next = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
