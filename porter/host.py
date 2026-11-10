@@ -104,18 +104,22 @@ def host_fingerprint(title_id):
     """sha256 over the sources a game's libdmhost.so and the APK's assets come from: nxnative/dm without its games, tools, tests and build output, plus the game's own profile
     folder. The same commit gives the same value in a checkout and in a bundle (both have the committed files), and a docs-only commit leaves it alone"""
     global _fp_base
-    def walk(root, skip):
-        out = []
-        for d, dirs, files in os.walk(root):
-            dirs[:] = sorted(x for x in dirs if not (skip and x in _FP_SKIP_DIRS) and not x.startswith('.'))
-            for f in sorted(files):
-                if f.endswith(('.md', '.pyc', '.d', '.o')): continue
-                q = Path(d) / f; out.append((q.relative_to(DM).as_posix(), hashlib.sha256(q.read_bytes()).hexdigest()))
-        return out
-    if _fp_base is None: _fp_base = walk(DM, True)
+    if _fp_base is None:
+        # a checkout: its committed files only (git ls-files), as the bundle has them; ignored build output (obj/, out/) would make the two differ
+        names = None
+        if (REPO / '.git').exists():
+            try:
+                r = subprocess.run(['git', '-C', str(REPO), 'ls-files', '-z', '--', DM.relative_to(REPO).as_posix()], capture_output=True, timeout=60)
+                if r.returncode == 0: names = [Path(REPO / n.decode()).relative_to(DM).as_posix() for n in r.stdout.split(b'\0') if n]
+            except (OSError, subprocess.SubprocessError, ValueError): names = None
+        if names is None: names = [(Path(d) / f).relative_to(DM).as_posix() for d, _, fs in os.walk(DM) for f in fs]
+        _fp_base = sorted(n for n in names if not n.endswith(('.md', '.pyc', '.d', '.o')) and not set(n.split('/')[:-1]) & _FP_SKIP_DIRS
+                          and not any(p.startswith('.') for p in n.split('/')[:-1]) and (DM / n).is_file())
+    own = [n for n in _fp_base]
     g = DM / 'games' / title_id
-    rows = _fp_base + (walk(g, False) if g.is_dir() else []) + [(f'games/{f}', hashlib.sha256((DM / 'games' / f).read_bytes()).hexdigest()) for f in ('game.py',) if (DM / 'games' / f).is_file()]
-    return hashlib.sha256('\n'.join(f'{h}  {r}' for r, h in rows).encode()).hexdigest()
+    if g.is_dir(): own += sorted((Path(d) / f).relative_to(DM).as_posix() for d, _, fs in os.walk(g) for f in fs if not f.endswith('.pyc') and '__pycache__' not in d)
+    own += [n for n in ('games/game.py',) if (DM / n).is_file()]
+    return hashlib.sha256('\n'.join(f'{hashlib.sha256((DM / n).read_bytes()).hexdigest()}  {n}' for n in own).encode()).hexdigest()
 
 
 # ---- build folders (<game folder>/<title ID>_build, porter port): a derived profile lives there, and the header the port's host was built with
