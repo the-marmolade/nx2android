@@ -107,7 +107,7 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_DRIVER, OVM_DRUN, OVM_DQUIT, OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM, OVM_REC, OVM_HEAVY, OVM_MTREP, OVM_BATT, OVM_AA, OVM_UP, OVM_RES, OVM_PAD, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_DRIVER, OVM_DRUN, OVM_DQUIT, OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM, OVM_REC, OVM_HEAVY, OVM_MTREP, OVM_BATT, OVM_AA, OVM_UP, OVM_RES, OVM_PAD, OVM_QUIT, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
             // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels)
 #define OVM_TABS 6   // the open tab in dm_menu_state: bit 8, bit 19 and bit 29 (low to high)
@@ -121,7 +121,7 @@ int dm_res_value(char *v, int cap);   // front_android.c: the row's text; 1 in t
 #define OVM_PER_TAB 5   // (-1: no row; OVM_ROWS stays under 8, the highlighted row's three bits)
 // Driver: the Vulkan driver for the next launch (the APK's DM_VK_DRIVERS and the system's), the one this launch runs on, and Quit, which the choice needs: a driver
 // is loaded once, before the game's first frame (gfx_vk_core.c vk_init). dm_menu_state bits 29..30: the chosen driver
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, -1},
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_QUIT},   // (OVM_QUIT: Quit game, the app closed: front_android.c game_quit)
                                                          {OVM_DRIVER, OVM_DRUN, OVM_DQUIT, -1, -1}, {OVM_FCAP, OVM_C120, OVM_LOWLAT, OVM_PREWARM, -1},
                                                          {OVM_REC, OVM_HEAVY, OVM_MTREP, OVM_BATT, -1}, {OVM_AA, OVM_UP, OVM_RES, -1, -1}};
 // Tools: Record 60 s (perf_android.c dm_perf_record_start, closes the menu), Heavy mode (DM_NVN_ASYNC: the replay on a thread of its own, on the prime core; next

@@ -636,8 +636,9 @@ int dm_tools_value(int item, char *v, int cap) {
 }
 // Quit for the chosen driver: Activity.finishAndRemoveTask (on_destroy ends the process); reopened, the app loads it. Relaunching by itself would need an activity in a
 // process of its own: one that ends its own process while in front is taken off the screen, not started again
-static void driver_quit(void) {
-    settings_save(); LOG("[menu] Quit for the driver %s", g_drv_name[atomic_load(&g_set_driver) < 0 ? g_drv_run : atomic_load(&g_set_driver)]);
+// the app closed from the menu (Quit game; Quit for a driver): the settings saved, then Activity.finishAndRemoveTask
+static void game_quit(void) {
+    settings_save();
     JavaVM *vm = g_act ? g_act->vm : NULL; JNIEnv *E;
     if (!vm || (*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) _exit(0);
     jclass c = (*E)->GetObjectClass(E, g_act->clazz); jmethodID m = c ? (*E)->GetMethodID(E, c, "finishAndRemoveTask", "()V") : NULL;
@@ -645,6 +646,7 @@ static void driver_quit(void) {
     if (m) (*E)->CallVoidMethod(E, g_act->clazz, m);
     if (!m || jx(E)) _exit(0);
 }
+static void driver_quit(void) { LOG("[menu] Quit for the driver %s", g_drv_name[atomic_load(&g_set_driver) < 0 ? g_drv_run : atomic_load(&g_set_driver)]); game_quit(); }
 static void menu_tab(int t) { t = (t % OVM_TABS + OVM_TABS) % OVM_TABS; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
 static void ed_open(void); static void sp_open(void); static void save_export(void);
 static void menu_do(int item) {
@@ -674,6 +676,7 @@ static void menu_do(int item) {
                                 LOG("[menu] resolution %s from the next launch", m == 2 ? "4K" : m ? "1440p" : "native"); }   // Native, 1440p, 4K
     else if (item == OVM_DRUN) return;   // (a note: the driver this launch runs on)
     else if (item == OVM_DQUIT) { dm_haptics_android_tap(); driver_quit(); return; }
+    else if (item == OVM_QUIT) { dm_haptics_android_tap(); LOG("[menu] Quit game"); game_quit(); return; }   // (the game's own save is the game's: nothing is written for it here)
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
 }

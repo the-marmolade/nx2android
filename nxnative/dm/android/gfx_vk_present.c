@@ -393,8 +393,8 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
 static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save",
                                               "Next launch", "Running", "Save first, then", "Frame rate", "120 Hz container", "Low latency", "Shader prewarm", "Record 60 s", "Heavy mode", "MT replay",
-                                              "Battery saver", "Anti-aliasing", "Upscaling", "Resolution", "Face buttons", "Resume", ""};
-static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit"};   // the rows that are a button: its word
+                                              "Battery saver", "Anti-aliasing", "Upscaling", "Resolution", "Face buttons", "Quit game", "Resume", ""};
+static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_DQUIT] = "Quit", [OVM_QUIT] = "Quit"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
 static void ov_menu_panel(const ov_canvas *cv, int st) {
@@ -1340,7 +1340,9 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     }
     VkImageLayout lay = fx ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     int external = dm_external_active();
-    int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps(), prog = dm_prewarm_progress(NULL, NULL);
+    int ovm = external ? 0 : dm_overlay_visible(), menu = dm_menu_state(),   // (the on-screen gamepad stays on the device; the menu is on the external display as well:
+                                                                           // a handheld with its own controls is played looking at the television)
+    fps = dm_overlay_fps(), prog = dm_prewarm_progress(NULL, NULL);
     if (prog) { ovm = 0; menu = -1; fps = 0; }   // the prewarm's screen alone
     if ((ovm || menu >= 0 || fps || prog) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
         barrier(cb, tgt, lay, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); lay = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
