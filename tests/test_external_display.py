@@ -18,9 +18,11 @@ STUBS = {
  public Display(int i) { this(i, 2, "HDMI Screen", new Mode(1, 1920, 1080, 60f)); }
  public Display(int i, int t, String n, Mode... m) { id=i; type=t; name=n; modes=m; }
  public int getDisplayId() { return id; } public String getName() { return name; } public Mode[] getSupportedModes() { return modes; }
+ public Mode current; public Mode getMode() { return current; }
  public int getType() { if (type < 0) throw new SecurityException("hidden"); return type; }
  public static class Mode { private final int id, w, h; private final float hz; public Mode(int i, int w, int h, float hz) { id=i; this.w=w; this.h=h; this.hz=hz; }
   public int getModeId() { return id; } public int getPhysicalWidth() { return w; } public int getPhysicalHeight() { return h; } public float getRefreshRate() { return hz; } } }''',
+    'android/util/Log.java': '''package android.util; public class Log { public static int i(String t, String m) { return 0; } }''',
     'android/view/WindowManager.java': '''package android.view; public interface WindowManager { class LayoutParams { public int preferredDisplayModeId; } }''',
     'android/view/Window.java': '''package android.view; public class Window { public static int lastMode; private final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(); public WindowManager.LayoutParams getAttributes() { return lp; } public void setAttributes(WindowManager.LayoutParams a) { lastMode = a.preferredDisplayModeId; } }''',
     'android/view/Surface.java': '''package android.view; public class Surface {}''',
@@ -52,6 +54,8 @@ public class Check {
   if(ExternalDisplay.pick(new Display[]{lower, small, tv})!=tv)throw new AssertionError("pick");
   if(ExternalDisplay.bestMode(tv).getModeId()!=13)throw new AssertionError("mode " + ExternalDisplay.bestMode(tv).getModeId());
   a.manager.displays=new Display[]{lower, tv}; d.start(); if(Presentation.last!=tv||Window.lastMode!=13)throw new AssertionError("television mode"); d.stop();
+  // already in its best mode: no mode is asked for (another would make the television renegotiate the link)
+  tv.current=tv.getSupportedModes()[2]; Window.lastMode=0; d.start(); if(Presentation.last!=tv||Window.lastMode!=0)throw new AssertionError("mode asked for again"); d.stop();
  }
 }''',
 }

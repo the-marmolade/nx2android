@@ -236,7 +236,7 @@ enum { SP_DISC = OV_N, SP_BLACK, SP_WHITE, SP_ACCENT, SP_GREEN, SP_AMBER, SP_RED
 #define OV_FPS_CHARS "0123456789 FPSCBATO-GUms.%MHzDER/LW"   // (the temperature rows: "SOC 52C", "BAT 38C"; the HUD's lines: "16.7ms 33.3ms", "GPU 87% 680MHz")
 #define OV_HOT_CHARS 19   // the first 19 (the temperature rows' characters) again in red after them: all 35 twice would not fit a 960-texel raster (1920 x 1080)
 static struct { VkImage img; VkDeviceMemory mem; VkImageView view; VkSampler samp; VkDescriptorSetLayout dsl; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set;
-                VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
+                VkPipeline pipe; VkFormat pfmt; uint32_t w, h, sh, pw, ph, gh, gs, upk; float div; VkBuffer up; VkDeviceMemory upm; uint8_t *px; int uploaded, panel, lay, cver; float sp[SP_N][4];
                 VkRenderPass rp; VkFramebuffer fb[8]; VkImageView fbview[8]; VkExtent2D fbext[8]; } g_ov;
 static struct { const ov_theme *t; VkImage img; VkDeviceMemory mem; VkImageView view; VkDescriptorSet set; VkBuffer up; VkDeviceMemory upm; uint32_t upk; int ready; } g_tt[2];   // per layout
 // Without dynamic rendering (a Vulkan 1.1 / 1.2 device, V.has_dynrender) the overlay draws in a render pass object over the swapchain image: one pass for the swapchain's
@@ -307,7 +307,8 @@ static void ov_text(uint8_t *px, uint32_t w, uint32_t h, float cx, float cy, con
     pf_draw(f, s, (int)(cx - pf_width(f, s) * scale / 2.0f), (int)(cy + PF_CAP * scale / 2.0f), scale, ov_text_plot, &o);
 }
 // colour drawing for the menu button and the panel: straight alpha, "over" blending, shapes antialiased by their distance
-typedef struct { uint8_t *px; uint32_t stride, x0, y0, w, h; } ov_canvas;   // a w x h window of rows `stride` texels wide, at (x0, y0)
+typedef struct { uint8_t *px; uint32_t stride, x0, y0, w, h; float div; } ov_canvas;   // a w x h window of rows `stride` texels wide, at (x0, y0);
+                                                                                     // div: window pixels per texel (0: 2, the phone window's raster)
 static void cv_blend(const ov_canvas *cv, int x, int y, const uint8_t c[4], float cov) {
     if (x < 0 || y < 0 || (uint32_t)x >= cv->w || (uint32_t)y >= cv->h || cov <= 0) return;
     uint8_t *p = cv->px + 4 * ((size_t)(cv->y0 + y) * cv->stride + cv->x0 + x);
@@ -483,18 +484,18 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
 }
 // The layout editor's toolbar and prompt (overlay_layout.h ov_ed_*), at half the window's scale in the raster's panel rectangle: the toolbar at its top, the
 // prompt under it (gfx_vk_present.c ov_render draws each where overlay_layout.h puts it)
-static void ov_ed_rects_for(float W, float H, float pw, float ph, float tb[4], float pr[4]) {
-    float a[4], b[4]; ov_ed_rect(W, H, a); ov_ed_prompt_rect(W, H, b);
-    tb[0] = 0; tb[1] = 0; tb[2] = fminf(a[2] / 2, pw); tb[3] = a[3] / 2;
-    pr[0] = 0; pr[1] = tb[3] + 2; pr[2] = fminf(b[2] / 2, pw); pr[3] = fminf(b[3] / 2, ph - pr[1]);
+static void ov_ed_rects_for(float W, float H, float pw, float ph, float div, float tb[4], float pr[4]) {   // div: window pixels per raster texel
+    float a[4], b[4]; ov_ed_rect(W, H, a); ov_ed_prompt_rect(W, H, b); if (div <= 0) div = 2;
+    tb[0] = 0; tb[1] = 0; tb[2] = fminf(a[2] / div, pw); tb[3] = a[3] / div;
+    pr[0] = 0; pr[1] = tb[3] + 2; pr[2] = fminf(b[2] / div, pw); pr[3] = fminf(b[3] / div, ph - pr[1]);
 }
-static void ov_ed_rects(float tb[4], float pr[4]) { ov_ed_rects_for((float)g_sext.width, (float)g_sext.height, (float)g_ov.pw, (float)g_ov.ph, tb, pr); }
+static void ov_ed_rects(float tb[4], float pr[4]) { ov_ed_rects_for((float)g_sext.width, (float)g_sext.height, (float)g_ov.pw, (float)g_ov.ph, g_ov.div, tb, pr); }
 static const char *ov_ctl_name(const ov_ctl *c) {
     return c->kind == OV_STICK_L ? "Left stick" : c->kind == OV_STICK_R ? "Right stick" : c->kind == OV_DPAD ? "D-pad" : c->kind == OV_MENU ? "Menu button"
          : !strcmp(c->label, "-") ? "Minus" : !strcmp(c->label, "+") ? "Plus" : c->label;
 }
 static void ov_edit_panel(const ov_canvas *cv, int st, float W, float H) {
-    float tb[4], pr[4]; ov_ed_rects_for(W, H, (float)cv->w, (float)cv->h, tb, pr);
+    float tb[4], pr[4]; ov_ed_rects_for(W, H, (float)cv->w, (float)cv->h, cv->div, tb, pr);
     int held = (st >> 4 & 15) - 1, sel = (st >> 8 & 255) - 1;
     static const char *const words[OVE_ALL] = {"-", "+", "Reset", "Cancel", "Save", "Snap to grid: Off", "Discard", "Keep editing"};
     cv_rrect(cv, tb[0], tb[1], tb[0] + tb[2], tb[1] + tb[3], tb[3] * 0.14f, C_BG);
@@ -534,7 +535,7 @@ static void ov_save_panel(const ov_canvas *cv, int st) {
     }
 }
 static void ov_panel(int st) {   // the pause menu, the text entry or the layout editor, for menu state st (dm_menu_state), into the panel's rows of the upload buffer
-    ov_canvas cv = {g_ov.px, g_ov.w, 0, g_ov.h + g_ov.sh, g_ov.pw, g_ov.ph};
+    ov_canvas cv = {g_ov.px, g_ov.w, 0, g_ov.h + g_ov.sh, g_ov.pw, g_ov.ph, g_ov.div};
     for (uint32_t y = 0; y < g_ov.ph; y++) memset(g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.w), 0, (size_t)g_ov.pw * 4);
     if (st >> 16 & 1) ov_text_panel(&cv);   // a text entry is open (dm_menu_state)
     else if (st & OVE_ST) ov_edit_panel(&cv, st, (float)g_sext.width, (float)g_sext.height);
@@ -890,7 +891,10 @@ static void ov_theme_upload(VkCommandBuffer cb, uint32_t k, int lay) {
     T->t = t; T->upk = k; T->ready = 1;
 }
 static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: this present's slot (its fence is not signalled yet)
-    uint32_t w = g_sext.width / 2, h = g_sext.height / 2; int lay = dm_overlay_layout();
+    // the raster: half the window's size on the device; on a larger window (a television in TV mode, 3840 x 2160) no more texels than a 1920-pixel one has,
+    // the GPU scaling it up, so a menu change costs on the television what it costs on the device
+    float div = fmaxf(2.0f, (float)(g_sext.width > g_sext.height ? g_sext.width : g_sext.height) / 960.0f);
+    uint32_t w = (uint32_t)(g_sext.width / div), h = (uint32_t)(g_sext.height / div); int lay = dm_overlay_layout();
     if (!g_ov.dsl) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, 1, &b}; VKCHK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_ov.dsl));
@@ -935,7 +939,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         vkDeviceWaitIdle(V.dev);
         if (g_ov.view) { vkDestroyImageView(V.dev, g_ov.view, NULL); vkDestroyImage(V.dev, g_ov.img, NULL); vkFreeMemory(V.dev, g_ov.mem, NULL); vkDestroyBuffer(V.dev, g_ov.up, NULL); vkFreeMemory(V.dev, g_ov.upm, NULL); }
         g_ov.lay = lay; uint32_t sh = ov_layout_sprites(w, h); float mr[4]; ov_menu_rect((float)g_sext.width, (float)g_sext.height, mr);
-        g_ov.pw = (uint32_t)(mr[2] / 2) + 1; g_ov.ph = (uint32_t)(mr[3] / 2) + 1; if (g_ov.pw > w) g_ov.pw = w;
+        g_ov.div = div; g_ov.pw = (uint32_t)(mr[2] / div) + 1; g_ov.ph = (uint32_t)(mr[3] / div) + 1; if (g_ov.pw > w) g_ov.pw = w;
         g_ov.gs = (uint32_t)fmaxf(2, roundf(h * 0.022f / PF_CAP)); g_ov.gh = PF_CAP * g_ov.gs + 4;   // the counter's characters: 2.2% of the window's height
         uint32_t th = h + sh + g_ov.ph + g_ov.gh;
         VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {w, th, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL,
@@ -958,17 +962,21 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
     }
     uint32_t y0 = 0, rows = g_ov.h + g_ov.sh + g_ov.ph + g_ov.gh;   // the rows to upload
     if (g_ov.uploaded && menu >= 0 && menu != g_ov.panel) {   // only the panel, after the last copy out of the buffer has run
-        VkFence f[8]; uint32_t n = 0; for (uint32_t i = 0; i < 8; i++) if (i != k) f[n++] = g_pfence[i];
-        vkWaitForFences(V.dev, n, f, 1, 1000000000ull);
+        if (g_ov.upk != k) vkWaitForFences(V.dev, 1, &g_pfence[g_ov.upk], 1, 1000000000ull);   // (the copy recorded in slot upk is the only one that reads the buffer)
         y0 = g_ov.h + g_ov.sh; rows = g_ov.ph; g_ov.uploaded = 0;
     }
-    if (menu >= 0 && menu != g_ov.panel) { ov_panel(menu); g_ov.panel = menu; }
+    if (menu >= 0 && menu != g_ov.panel) {
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        ov_panel(menu); g_ov.panel = menu;
+        clock_gettime(CLOCK_MONOTONIC, &t1); double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        static int logged; if (ms > 4 && logged < 20) { logged++; VKLOG("[menu] panel drawn in %.1f ms (%ux%u texels, window %ux%u)", ms, g_ov.pw, g_ov.ph, g_sext.width, g_sext.height); }
+    }
     if (!g_ov.uploaded) {
         VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, y0 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, g_ov.img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
         VkBufferImageCopy c = {(VkDeviceSize)y0 * g_ov.w * 4, g_ov.w, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, (int32_t)y0, 0}, {g_ov.w, rows, 1}};
-        vkCmdCopyBufferToImage(cb, g_ov.up, g_ov.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        vkCmdCopyBufferToImage(cb, g_ov.up, g_ov.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c); g_ov.upk = k;
         b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT; b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
         g_ov.uploaded = 1;

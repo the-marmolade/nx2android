@@ -79,6 +79,8 @@ public final class ExternalDisplay implements DisplayManager.DisplayListener {
         return best;
     }
 
+    static String describe(Display.Mode m) { return m == null ? "no mode" : m.getPhysicalWidth() + "x" + m.getPhysicalHeight() + "@" + Math.round(m.getRefreshRate()) + "Hz"; }
+
     /** The external display the game goes to: none of the built-in screens, and the one with the most pixels when several are connected. */
     public static Display pick(Display[] candidates) {
         Display best = null; long area = -1;
@@ -113,8 +115,13 @@ public final class ExternalDisplay implements DisplayManager.DisplayListener {
             }
         });
         next.setContentView(view);
-        Display.Mode mode = bestMode(selected);   // the television's own resolution: Android mirrors at the mode it found, often 1080p
-        if (mode != null && next.getWindow() != null) {
+        // The television's best mode, asked for only when it is not in it already: another mode makes the television renegotiate the link (the seconds of
+        // black a television shows when a source changes resolution), on top of the one it did when the cable went in. Android usually mirrors at the
+        // television's preferred mode, and then nothing changes.
+        Display.Mode mode = bestMode(selected), current = selected.getMode();
+        boolean change = mode != null && (current == null || current.getModeId() != mode.getModeId());
+        android.util.Log.i("nx2a-dual", "display \"" + selected.getName() + "\" in " + describe(current) + ", best " + describe(mode) + (change ? ": asking for it" : ": kept"));
+        if (change && next.getWindow() != null) {
             WindowManager.LayoutParams lp = next.getWindow().getAttributes();
             lp.preferredDisplayModeId = mode.getModeId();
             next.getWindow().setAttributes(lp);
