@@ -94,6 +94,19 @@ def _parser():
     up.add_argument('--device', default='', help='adb serial (default: the configured device, else the only one)')
     up.add_argument('--folder', action='append', default=[], metavar='TITLEID=FOLDER', help="a game's build folder (see porter host --folder); may repeat")
     up.add_argument('--json', action='store_true')
+    dv = sub.add_parser('drivers', help="a port's Vulkan drivers (up to three, the pause menu's Driver tab), changed without the game files: the saves and data stay")
+    dvs = dv.add_subparsers(dest='drivers_cmd', required=True)
+    d1 = dvs.add_parser('list', help="the drivers the app carries and its default"); d2 = dvs.add_parser('file', help='what a driver file (.zip or .so) holds')
+    d3 = dvs.add_parser('set', help='the app with exactly these drivers')
+    d2.add_argument('path')
+    d3.add_argument('--keep', action='append', default=[], metavar='NAME=LIB', help='a driver the app has (its library name), under NAME in the menu')
+    d3.add_argument('--add', action='append', default=[], metavar='NAME=FILE', help='a driver file (.zip or .so) added under NAME')
+    d3.add_argument('--spec', default='', metavar='JSON_FILE', help='instead of --keep/--add: {"drivers": [{"name", "lib" | "file"}], "default": index or -1} (the GUI writes it)')
+    d3.add_argument('--default', default='', help="the default: a driver's NAME, or system (the device's own); default: the first driver")
+    d3.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
+    for d in (d1, d2, d3):
+        d.add_argument('--json', action='store_true')
+        if d is not d2: d.add_argument('--package', default='', help='the app (default: the only ported game installed)'); d.add_argument('--device', default='', help='adb serial')
     return ap
 
 
@@ -300,10 +313,47 @@ def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt 
     return 0
 
 
+def cmd_drivers(a):   # porter drivers list / file / set
+    import contextlib
+    from porter import config, driver, saves, toolchain
+    from porter.upstream import BuildError
+    try:
+        with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):
+            if a.drivers_cmd == 'file': out = driver.read_driver(a.path)
+            else:
+                cfg = config.load(); adb = saves.connect(toolchain.find_adb(cfg), a.device or cfg.get('device')); pkg = saves.pick_app(adb, a.package)
+                if a.drivers_cmd == 'list': out = driver.current(adb, pkg)
+                else:
+                    if a.spec:
+                        spec = json.loads(Path(a.spec).read_text(encoding='utf-8')); ds, dflt = spec.get('drivers', []), int(spec.get('default', -1))
+                    else:
+                        def pair(s, what):
+                            if '=' not in s: raise BuildError(f'{what} takes NAME=VALUE: {s}')
+                            return s.split('=', 1)
+                        ds = [{'name': n, 'lib': v} for n, v in (pair(s, '--keep') for s in a.keep)] + [{'name': n, 'file': v} for n, v in (pair(s, '--add') for s in a.add)]
+                        names = [driver.menu_name(d['name']) for d in ds]
+                        if a.default.lower() == 'system': dflt = -1
+                        elif a.default: dflt = names.index(driver.menu_name(a.default)) if driver.menu_name(a.default) in names else -2
+                        else: dflt = 0 if ds else -1
+                        if dflt == -2: raise BuildError(f'--default {a.default}: not one of the drivers ({", ".join(names)}) or system')
+                    out = driver.apply(adb, pkg, ds, dflt, a.jobs)
+    except (BuildError, ValueError, OSError) as e:
+        if a.json: _print_json({'error': str(e)})
+        else: print(e, file=sys.stderr)
+        return 1
+    if a.json: _print_json(out)
+    elif a.drivers_cmd == 'file': print(f'{out["name"]}: {out["lib"]}' + (f' ({out["description"]})' if out['description'] else ''))
+    else:
+        for d in out['drivers']: print(f'{"*" if d["lib"] == out["default"] else " "} {d["name"]:22} {d["lib"]}')
+        if not out['default']: print('* System (the device\'s own driver)')
+        if a.drivers_cmd == 'list' and not out['loader']: print('(no driver loader in the app yet: setting a driver builds and adds it)')
+    return 0
+
+
 STATUS_WORD = {'current': 'up to date', 'update': 'update available', 'risky': 'rewriter changed', 'folder': 'needs its folder', 'port': 'port again'}
 
 
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver, 'drivers': cmd_drivers}[a.cmd](a)

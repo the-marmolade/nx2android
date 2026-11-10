@@ -89,7 +89,7 @@ def profile_hash(title_id):
 
 
 STAMP = 'nx2a-host.json'   # in the app's files folder: the host an update put there, {'version', 'fingerprint', 'made', 'forced'}
-_FP_SKIP_DIRS = {'games', 'tools', 'out', '__pycache__', '.git', 'tests', 'docs'}
+_FP_SKIP_DIRS = {'games', 'tools', 'out', '__pycache__', '.git', 'tests', 'docs', 'apk'}   # (android/apk: the tools that pack an APK, not what goes in it)
 
 
 def checkout_version():   # the bundle's VERSION (packaging/build_bundle.py), else git describe of the checkout

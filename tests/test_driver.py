@@ -255,5 +255,101 @@ class HostTest(unittest.TestCase):   # porter host's update(): its refusals, the
         self.assertEqual(self.envs[-1].get('DM_GAMES_DIR'), str(bf / 'profile-derived'))   # the host is built from the derived profile
 
 
+ARM64 = b'\x7fELF\x02\x01\x01' + b'\0' * 11 + (183).to_bytes(2, 'little')   # an ELF header's first 20 bytes: 64-bit, AArch64
+
+
+class SetDevice(Adb):   # porter drivers' made-up device: files in the app's folder, its installed APK (pull gives it back, ls of its library folder lists it)
+    def __init__(self, apk, files):
+        super().__init__('adb'); self.serial = 'dev'; self.apk, self.files, self.ops = Path(apk), dict(files), []
+    def pick(self): return 'dev'
+    def run(self, *a, timeout=None, check=True, retries=3):
+        a = [str(x) for x in a]; self.ops.append(a[0] if a[0] != 'shell' else a[1].split()[0])
+        if a[0] == 'pull': shutil.copyfile(self.apk, a[2]); return ''
+        if a[0] == 'push': self.files[a[2].split('/files/', 1)[1]] = Path(a[1]).read_text(encoding='utf-8'); return ''
+        if a[0] == 'install': self.apk.write_bytes(Path(a[-1]).read_bytes()); return 'Success'
+        if a[0] != 'shell': return ''
+        cmd = a[1]
+        if cmd.startswith('pm path'): return f'package:/data/app/{PKG}/base.apk\n'
+        if cmd.startswith('ls '):
+            with zipfile.ZipFile(self.apk) as z: return '\n'.join(n.split('/')[-1] for n in z.namelist() if n.startswith('lib/arm64-v8a/')) + '\n'
+        if cmd.startswith('cat '): return self.files.get(cmd.split()[1].strip("'").split('/files/', 1)[1], '')
+        return ''
+
+
+class DriverSetTest(unittest.TestCase):   # porter drivers (the GUI's Drivers window): up to three drivers, the default, a driver from a .zip or a .so, the loader added
+    def setUp(self):
+        self.t = Path(tempfile.mkdtemp(prefix='nx2a_drivers_test_')); self.addCleanup(shutil.rmtree, self.t, ignore_errors=True)
+
+    def apk(self, drivers=('libvulkan.freedreno.so', 'libvulkan.purple.so'), loader=True):
+        extra = []
+        for n in tuple(drivers) + (HOOKS if loader else ()):
+            (self.t / n).write_bytes(ARM64 + n.encode() * 20); extra += ['--extra-so', str(self.t / n)]
+        so = self.t / 'libdmhost.so'; so.write_bytes(b'\x7fELF' + b'\0' * 60)
+        subprocess.run([sys.executable, str(APK / 'mkapk.py'), str(so), str(self.t / 'a.apk'), str(paths.signing_key()), '--lib', 'dmhost', '--release'] + extra, check=True, capture_output=True)
+        return self.t / 'a.apk'
+
+    def zipped(self, name='Turnip 27.0.0-R2', lib='libvulkan_freedreno.so', data=ARM64 + b'turnip r2'):   # an AdrenoTools driver package
+        z = self.t / f'{name}.zip'
+        with zipfile.ZipFile(z, 'w') as f:
+            f.writestr('meta.json', json.dumps({'name': name, 'description': 'A7xx', 'driverVersion': 'Vulkan 1.4.367', 'libraryName': lib})); f.writestr(lib, data)
+        return z
+
+    def test_env(self):
+        env = 'DM_LANG=en-US\nDM_VK_DRIVER=libvulkan.purple.so\nDM_VK_DRIVERS=freedreno=libvulkan.freedreno.so;purple=libvulkan.purple.so\n'
+        self.assertEqual(driver.env_drivers(env), ([('freedreno', 'libvulkan.freedreno.so'), ('purple', 'libvulkan.purple.so')], 'libvulkan.purple.so'))
+        self.assertEqual(driver.env_drivers('DM_VK_DRIVER=libvulkan.purple.so\n'), ([('purple', 'libvulkan.purple.so')], 'libvulkan.purple.so'))   # one driver, no list
+        self.assertEqual(driver.env_with_drivers(env, [('T', 'libt.so')], ''), 'DM_LANG=en-US\nDM_VK_DRIVERS=T=libt.so\n')   # the device's own as the default: no DM_VK_DRIVER
+        self.assertEqual(driver.settings_without_choice('fps=2\ndriver=1\nresolution=1\n'), 'fps=2\nresolution=1\n')
+        self.assertEqual(driver.menu_name('Turnip; v27=R2 ✓ with a very long name'), 'Turnip v27R2 with a')
+
+    def test_read_driver(self):
+        d = driver.read_driver(self.zipped(), self.t)
+        self.assertEqual((d['name'], d['lib']), ('Turnip 27.0.0-R2', 'libvulkan_freedreno.so')); self.assertIn('Vulkan 1.4.367', d['description'])
+        self.assertEqual(Path(d['file']).read_bytes(), ARM64 + b'turnip r2')
+        so = self.t / 'vulkan.purple.so'; so.write_bytes(ARM64 + b'purple')
+        self.assertEqual((driver.read_driver(so)['name'], driver.read_driver(so)['lib']), ('purple', 'libvulkan.purple.so'))
+        x86 = self.t / 'libx.so'; x86.write_bytes(b'\x7fELF\x02\x01\x01' + b'\0' * 11 + (62).to_bytes(2, 'little'))
+        with self.assertRaises(BuildError): driver.read_driver(x86)                      # not an arm64 library
+        with self.assertRaises(BuildError): driver.read_driver(self.zipped(lib='libvulkan_freedreno.so', data=b'not elf'))
+
+    def test_apply(self):
+        dev = SetDevice(self.apk(), {'env.txt': 'DM_LANG=en-US\nDM_VK_DRIVER=libvulkan.freedreno.so\nDM_VK_DRIVERS=freedreno=libvulkan.freedreno.so;purple=libvulkan.purple.so\n',
+                                     'settings.txt': 'fps=2\ndriver=2\n', 'nx2a-data.json': '{"title_id": "0100000011D90000"}'})
+        cur = driver.current(dev, PKG)
+        self.assertEqual((cur['drivers'], cur['default'], cur['loader']), ([{'name': 'freedreno', 'lib': 'libvulkan.freedreno.so'}, {'name': 'purple', 'lib': 'libvulkan.purple.so'}],
+                                                                           'libvulkan.freedreno.so', True))
+        out = driver.apply(dev, PKG, [{'name': 'freedreno', 'lib': 'libvulkan.freedreno.so'}, {'name': 'R2', 'file': str(self.zipped())}], 1)   # purple out, R2 in, R2 the default
+        self.assertEqual(out['drivers'], [{'name': 'freedreno', 'lib': 'libvulkan.freedreno.so'}, {'name': 'R2', 'lib': 'libvulkan_freedreno.so'}])
+        got = libs(dev.apk)
+        self.assertEqual(set(got), {'libdmhost.so', 'libvulkan.freedreno.so', 'libvulkan_freedreno.so', *HOOKS})
+        self.assertEqual(got['libvulkan.freedreno.so'], ARM64 + b'libvulkan.freedreno.so' * 20); self.assertEqual(got['libvulkan_freedreno.so'], ARM64 + b'turnip r2')
+        self.assertEqual(dev.files['env.txt'], 'DM_LANG=en-US\nDM_VK_DRIVER=libvulkan_freedreno.so\nDM_VK_DRIVERS=freedreno=libvulkan.freedreno.so;R2=libvulkan_freedreno.so\n')
+        self.assertEqual(dev.files['settings.txt'], 'fps=2\n')   # the menu's old choice (an index into the old list) cleared
+        same = self.zipped(name='Other build')   # the same library name again: made unique
+        out = driver.apply(dev, PKG, out['drivers'] + [{'name': 'Other', 'file': str(same)}], -1)
+        self.assertEqual(out['drivers'][2]['lib'], 'libvulkan_freedreno_2.so'); self.assertEqual(out['default'], '')
+        self.assertNotIn('DM_VK_DRIVER=', dev.files['env.txt'])   # the device's own driver by default
+        with self.assertRaises(BuildError): driver.apply(dev, PKG, out['drivers'] + [{'name': 'Four', 'file': str(same)}], 0)   # three at most
+        with self.assertRaises(BuildError): driver.apply(dev, PKG, [{'name': 'a', 'lib': 'libvulkan.purple.so'}], 0)            # one the app no longer has
+        with self.assertRaises(BuildError): driver.apply(dev, PKG, [{'name': 'x', 'lib': 'libvulkan.freedreno.so'}, {'name': 'x', 'file': str(same)}], 0)   # two of one name
+
+    def test_loader_added(self):   # a port made without a driver: the loader is built (build.py --adrenotools, stood in for) and added with the first one
+        from unittest import mock
+        dev = SetDevice(self.apk(drivers=(), loader=False), {'env.txt': 'DM_LANG=en-US\n', 'nx2a-data.json': '{"title_id": "0100000011D90000"}'})
+        self.assertFalse(driver.current(dev, PKG)['loader'])
+        real = subprocess.run
+        def run(argv, *a, **kw):
+            argv = [str(x) for x in argv]
+            if argv[1].endswith('build.py'):
+                self.assertIn('--adrenotools', argv); out = Path(argv[argv.index('--out') + 1]); out.mkdir(parents=True, exist_ok=True)
+                for n in HOOKS: (out / n).write_bytes(ARM64 + b'built ' + n.encode())
+                return subprocess.CompletedProcess(argv, 0, '', '')
+            return real(argv, *a, **kw)
+        with mock.patch.object(driver.subprocess, 'run', side_effect=run), mock.patch('porter.toolchain.find_ndk', return_value=(self.t / 'ndk', '27.2')):
+            driver.apply(dev, PKG, [{'name': 'R2', 'file': str(self.zipped())}], 0)
+        got = libs(dev.apk); self.assertEqual(set(got), {'libdmhost.so', 'libvulkan_freedreno.so', *HOOKS}); self.assertEqual(got['libadrenotools.so'], ARM64 + b'built libadrenotools.so')
+        self.assertTrue(driver.current(dev, PKG)['loader'])
+
+
 if __name__ == '__main__':
     unittest.main()

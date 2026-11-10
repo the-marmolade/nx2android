@@ -5,6 +5,8 @@
 # overlay's font, which an APK ported before it came lacks).
 # The driver is loaded through libadrenotools and its hook libraries, which only an APK ported with a driver carries (porter port --vulkan-driver): one without them is refused.
 # Usage: apkdriver.py <in.apk> <out.apk> <key.json> [--driver <lib.so> | --system] [--host <libdmhost.so>] [--asset NAME=FILE ...]   → prints the driver library's name in the APK ('' with --system)
+#        apkdriver.py <in.apk> <out.apk> <key.json> --set-drivers [--set-driver LIB=FILE ...] [--loader FILE ...]   → the driver set replaced, in order (porter drivers: the
+#        GUI's Drivers window); --loader adds libadrenotools and its hooks to an APK ported without them
 import argparse, json, os, sys, zipfile
 
 from apksign import build_zip, sign_v2
@@ -20,6 +22,24 @@ def lib_name(path):   # the package manager extracts only lib*.so from lib/<abi>
 
 
 KEEP = object()   # rebuild(driver=KEEP): the driver library the APK has stays
+
+
+def rebuild_set(src, drivers, loader=(), host=None, assets=None):
+    """src's entries with every driver library replaced by drivers ([(lib name, path)], in that order: the pause menu's Driver tab lists up to three) and loader
+    (libadrenotools and its hooks, paths) added where src lacks them, so a port made without --vulkan-driver can take one: ([(name, data, align)], dropped names)"""
+    entries, dropped, _ = rebuild(src, None, host, assets)
+    have = {os.path.basename(e) for e, _, _ in entries if e.startswith(ABI)}
+    at = next(n for n, (e, _, _) in enumerate(entries) if e == ABI + 'libdmhost.so') + 1
+    for f in loader:
+        if os.path.basename(f) not in NEEDS: raise SystemExit(f'{f}: not one of the driver loader\'s libraries ({", ".join(sorted(NEEDS))})')
+        if os.path.basename(f) not in have: entries.insert(at, (ABI + os.path.basename(f), open(f, 'rb').read(), 16384)); have.add(os.path.basename(f))
+    if drivers and not NEEDS <= have:
+        raise SystemExit(f'{src} has no libadrenotools and no --loader was given: the driver could not be loaded')
+    seen = set()
+    for lib, path in drivers:
+        if not lib.startswith('lib') or not lib.endswith('.so') or '/' in lib or '\\' in lib or lib in OWN or lib in seen: raise SystemExit(f'{lib}: not a usable driver library name')
+        seen.add(lib); entries.insert(at, (ABI + lib, open(path, 'rb').read(), 16384)); at += 1
+    return entries, [d for d in dropped if d not in seen]
 
 
 def rebuild(src, driver=KEEP, host=None, assets=None):
@@ -59,15 +79,26 @@ def main():
     g = p.add_mutually_exclusive_group(); g.add_argument('--driver', help='the driver library (.so, such as Mesa\'s Turnip)'); g.add_argument('--system', action='store_true', help='no driver library: the device\'s own')
     p.add_argument('--host', help='libdmhost.so built again from this checkout (porter host); the driver stays unless --driver / --system is given')
     p.add_argument('--asset', action='append', default=[], metavar='NAME=FILE', help='FILE as assets/NAME, replacing an entry of that name (porter host: the overlay font)')
+    p.add_argument('--set-drivers', action='store_true', help='replace the APK\'s driver set with the --set-driver ones (none: no driver library)')
+    p.add_argument('--set-driver', action='append', default=[], metavar='LIB=FILE', help='with --set-drivers: FILE as lib/<abi>/LIB, in this order')
+    p.add_argument('--loader', action='append', default=[], metavar='FILE', help='with --set-drivers: libadrenotools or one of its hooks, added when the APK lacks it')
     a = p.parse_args()
-    if not (a.driver or a.system or a.host or a.asset): p.error('give --driver, --system, --host or --asset')
     if any('=' not in x or x.startswith('=') for x in a.asset): p.error('--asset takes NAME=FILE')
     assets = {n: f for n, _, f in (x.partition('=') for x in a.asset)}
-    entries, dropped, added = rebuild(a.src, None if a.system else a.driver or KEEP, a.host, assets)
+    if a.set_drivers:
+        if a.driver or a.system: p.error('--set-drivers replaces --driver / --system')
+        if any('=' not in x or x.startswith('=') for x in a.set_driver): p.error('--set-driver takes LIB=FILE')
+        entries, dropped = rebuild_set(a.src, [tuple(x.split('=', 1)) for x in a.set_driver], a.loader, a.host, assets)
+        result = {'drivers': [x.split('=', 1)[0] for x in a.set_driver], 'dropped': dropped}
+    else:
+        if a.set_driver or a.loader: p.error('--set-driver and --loader go with --set-drivers')
+        if not (a.driver or a.system or a.host or a.asset): p.error('give --driver, --system, --host or --asset')
+        entries, dropped, added = rebuild(a.src, None if a.system else a.driver or KEEP, a.host, assets)
+        result = {'driver': added, 'dropped': dropped}
     kj = json.load(open(a.key)); k = {n: int(v) for n, v in kj.items() if n != 'cert'}; crt = bytes.fromhex(kj['cert'])
     z, cd, eocd = build_zip(entries)
     open(a.out, 'wb').write(sign_v2(z, cd, eocd, k, crt))
-    print(json.dumps({'driver': added, 'dropped': dropped}))
+    print(json.dumps(result))
 
 
 if __name__ == '__main__': sys.exit(main())

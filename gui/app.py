@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter, QStyle, QTableWidget, QTableWidgetItem,
                                QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -534,10 +534,10 @@ class UpdatesTab(QWidget):
         row = QHBoxLayout(); self.version = QLabel(''); self.b_all = QPushButton('Update all available'); self.b_all.clicked.connect(self.update_all)
         self.b_refresh = QPushButton('Refresh'); self.b_refresh.clicked.connect(self.refresh)
         row.addWidget(self.version, 1); row.addWidget(self.b_all); row.addWidget(self.b_refresh); v.addLayout(row)
-        self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(['Game', 'Game version', 'Built from', 'Status', ''])
+        self.table = QTableWidget(0, 6); self.table.setHorizontalHeaderLabels(['Game', 'Game version', 'Built from', 'Status', '', 'Drivers'])
         self.table.verticalHeader().setVisible(False); self.table.setEditTriggers(QTableWidget.NoEditTriggers); self.table.setSelectionMode(QTableWidget.NoSelection)
         hh = self.table.horizontalHeader(); hh.setSectionResizeMode(0, QHeaderView.Stretch); self.table.setTextElideMode(Qt.ElideMiddle)
-        for c in (1, 3, 4): hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        for c in (1, 3, 4, 5): hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.Interactive); self.table.setColumnWidth(2, 190)   # a version such as v0.3.0-179-g78dd993-dirty, elided; its tooltip has it whole
         v.addWidget(self.table, 1)
         self.status = QLabel(''); self.status.setWordWrap(True); v.addWidget(self.status)
@@ -552,8 +552,9 @@ class UpdatesTab(QWidget):
         self.b_refresh.setEnabled(not self.busy)
         self.b_all.setEnabled(not self.busy and any(r.get('status') == 'update' for r in self.rows))
         for i in range(self.table.rowCount()):
-            w = self.table.cellWidget(i, 4)
-            if w: w.setEnabled(not self.busy)
+            for c in (4, 5):
+                w = self.table.cellWidget(i, c)
+                if w: w.setEnabled(not self.busy)
 
     def refresh(self):
         args = ['updates', '--json'] + [a for t, f in self.folders.items() for a in ('--folder', f'{t}={f}')]
@@ -581,6 +582,8 @@ class UpdatesTab(QWidget):
             if action:
                 b = QPushButton(action); b.clicked.connect(lambda _=False, r=r: self.act(r)); self.table.setCellWidget(i, 4, b)
             else: self.table.removeCellWidget(i, 4)
+            d = QPushButton('Drivers…'); d.setToolTip("The Vulkan drivers this game can use (the pause menu's Driver tab): add one from a file, remove one, pick the default")
+            d.clicked.connect(lambda _=False, r=r: DriversDialog(self, r).exec()); self.table.setCellWidget(i, 5, d)
 
     def act(self, r):
         s = r['status']
@@ -605,6 +608,122 @@ class UpdatesTab(QWidget):
             self.status.setText(f'{r.get("name")}: updated to {res.get("version")} ({size(res.get("host", 0))} engine). Its saves and data are unchanged.')
             self.next()
         self.set_busy(f'updating {r.get("name")}: building its engine and installing it (a minute or two)…'); call_json(self, args, got)
+
+
+class DriversDialog(QDialog):
+    """A port's Vulkan drivers (porter drivers): the ones its app carries, drivers added from a file (.zip from AdrenoTools or a .so), removed or renamed, and the default.
+    Apply rebuilds the app on the device without the game's files (the saves and data stay)"""
+    MAX = 3
+
+    def __init__(self, parent, game):
+        super().__init__(parent)
+        self.game, self.busy, self.rows = game, False, []   # rows: {'name', 'lib'} kept, or {'name', 'file', 'lib', 'description'} new
+        self.setWindowTitle(f'Drivers: {game.get("name") or game["package"]}'); self.resize(720, 400)
+        v = QVBoxLayout(self)
+        self.info = QLabel('Reading the drivers on the device…'); self.info.setWordWrap(True); self.info.setTextFormat(Qt.RichText); v.addWidget(self.info)
+        self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['Name in the pause menu', 'Library', 'From'])
+        self.table.verticalHeader().setVisible(False); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setSelectionMode(QTableWidget.SingleSelection)
+        hh = self.table.horizontalHeader(); hh.setSectionResizeMode(0, QHeaderView.ResizeToContents); hh.setSectionResizeMode(1, QHeaderView.ResizeToContents); hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.itemChanged.connect(self.renamed); v.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        self.b_add = QPushButton('Add from file…'); self.b_add.clicked.connect(self.add)
+        self.b_remove = QPushButton('Remove'); self.b_remove.clicked.connect(self.remove)
+        self.default = QComboBox(); self.default.currentIndexChanged.connect(lambda _: self.changed())
+        row.addWidget(self.b_add); row.addWidget(self.b_remove); row.addStretch(1); row.addWidget(QLabel('Default:')); row.addWidget(self.default); v.addLayout(row)
+        self.status = QLabel(''); self.status.setWordWrap(True); v.addWidget(self.status)
+        row = QHBoxLayout(); row.addStretch(1)
+        self.b_apply = QPushButton('Apply to the device'); self.b_apply.clicked.connect(self.apply)
+        close = QPushButton('Close'); close.clicked.connect(self.reject)
+        row.addWidget(self.b_apply); row.addWidget(close); v.addLayout(row)
+        self.dirty = False; self.load()
+
+    def load(self):
+        def got(res, code):
+            self.set_busy(None)
+            if not isinstance(res, dict) or 'drivers' not in res: self.status.setText(f'[RED] {(res or {}).get("error", "porter drivers list failed")}'); return
+            self.rows = [dict(d) for d in res['drivers']]
+            self.info.setText((f'GPU: <b>{res["gpu"]}</b>. ' if res.get('gpu') else '') + 'Up to three drivers, switched in the game\'s pause menu (Driver tab, from the next launch); '
+                              'the default is used until one is chosen there. A driver .zip from AdrenoTools (meta.json and a .so) or a bare .so works. '
+                              '<b>The saves and the game\'s data stay.</b>' + ('' if res.get('loader') else ' This game was ported without the driver loader: '
+                              'it is built and added the first time (a minute or so).'))
+            self.fill(res.get('default', '')); self.dirty = False; self.update_buttons(); self.status.setText('')
+        self.set_busy('reading the drivers on the device…'); call_json(self, ['drivers', 'list', '--package', self.game['package'], '--json'], got)
+
+    def fill(self, default_lib=None):   # the table and the default's choices from self.rows; default_lib: select it (None: keep the current choice by name)
+        keep = self.default.currentText() if default_lib is None else None
+        self.table.blockSignals(True); self.table.setRowCount(len(self.rows))
+        for i, d in enumerate(self.rows):
+            name = QTableWidgetItem(d['name'])
+            lib = QTableWidgetItem(d['lib']); lib.setFlags(lib.flags() & ~Qt.ItemIsEditable)
+            src = QTableWidgetItem(('new: ' + Path(d['file']).name + (f' ({d["description"]})' if d.get('description') else '')) if d.get('file') else 'in the app')
+            src.setFlags(src.flags() & ~Qt.ItemIsEditable); src.setToolTip(d.get('file') or '')
+            for j, it in enumerate((name, lib, src)): self.table.setItem(i, j, it)
+        self.table.blockSignals(False)
+        self.default.blockSignals(True); self.default.clear(); self.default.addItem('System (the device\'s own)', -1)
+        for i, d in enumerate(self.rows): self.default.addItem(d['name'], i)
+        if keep is not None: k = self.default.findText(keep)
+        else: k = next((i + 1 for i, d in enumerate(self.rows) if d.get('lib') == default_lib and not d.get('file')), 0)
+        self.default.setCurrentIndex(max(k, 0)); self.default.blockSignals(False)
+
+    def renamed(self, it):
+        if it.column() != 0: return
+        clean = ''.join(ch for ch in it.text() if ' ' <= ch <= '~' and ch not in ';=').strip()[:20]
+        old = self.rows[it.row()]['name']; new = clean or old
+        if new != old and new in {d['name'] for d in self.rows}: new = old; self.status.setText('Another driver has that name: the pause menu tells them apart by it.')
+        self.rows[it.row()]['name'] = new
+        if new != it.text(): self.table.blockSignals(True); it.setText(new); self.table.blockSignals(False)
+        i = self.default.findText(old)
+        if i > 0: self.default.setItemText(i, new)
+        if new != old: self.changed()
+
+    def changed(self): self.dirty = True; self.update_buttons()
+
+    def update_buttons(self):
+        self.b_add.setEnabled(not self.busy and len(self.rows) < self.MAX)
+        self.b_remove.setEnabled(not self.busy and bool(self.rows))
+        self.b_apply.setEnabled(not self.busy and self.dirty)
+        self.table.setEnabled(not self.busy); self.default.setEnabled(not self.busy)
+
+    def set_busy(self, msg):
+        self.busy = bool(msg)
+        if msg: self.status.setText(msg)
+        self.update_buttons()
+
+    def add(self):
+        f = QFileDialog.getOpenFileName(self, 'A Vulkan driver for Android (arm64)', '', 'Drivers (*.zip *.so);;All files (*)')[0]
+        if not f: return
+        def got(res, code):
+            self.set_busy(None)
+            if not isinstance(res, dict) or res.get('error') or 'lib' not in res: self.status.setText(f'[RED] {(res or {}).get("error", "not a driver")}'); return
+            name, k, names = res['name'], 2, {d['name'] for d in self.rows}
+            while name in names: name = f'{res["name"][:17]} {k}'; k += 1
+            self.rows.append({'name': name, 'file': res['file'], 'lib': res['lib'], 'description': res.get('description', '')})
+            self.fill(); self.changed(); self.status.setText(f'{name} added: Apply to put it in the game.')
+        self.set_busy(f'reading {Path(f).name}…'); call_json(self, ['drivers', 'file', f, '--json'], got)
+
+    def remove(self):
+        i = self.table.currentRow()
+        if i < 0: self.status.setText('Select a driver to remove.'); return
+        del self.rows[i]; self.fill(); self.changed()
+
+    def apply(self):
+        import json, tempfile
+        dflt = self.default.currentData()
+        spec = {'drivers': [{'name': d['name'], **({'file': d['file']} if d.get('file') else {'lib': d['lib']})} for d in self.rows], 'default': -1 if dflt is None else dflt}
+        fd, path = tempfile.mkstemp(prefix='nx2a_drivers_', suffix='.json'); os.close(fd); Path(path).write_text(json.dumps(spec), encoding='utf-8')
+        def got(res, code):
+            Path(path).unlink(missing_ok=True); self.set_busy(None)
+            if code or not isinstance(res, dict) or res.get('error'): self.status.setText(f'[RED] {(res or {}).get("error", "the change failed")}'); return
+            self.rows = [dict(d) for d in res['drivers']]; self.fill(res.get('default', '')); self.dirty = False; self.update_buttons()
+            self.status.setText('Done: the game has ' + (', '.join(d['name'] for d in self.rows) or 'no driver of its own') + '. Its saves and data are unchanged; '
+                                'the pause menu\'s Driver tab lists them from the next launch.')
+        self.set_busy('rebuilding the game\'s app with these drivers and installing it…')
+        call_json(self, ['drivers', 'set', '--package', self.game['package'], '--spec', path, '--json'], got)
+
+    def reject(self):
+        if self.busy: return   # an apply on its way: the window stays until it ends
+        if self.dirty and QMessageBox.question(self, 'Discard the changes?', 'The driver changes have not been applied to the device. Close anyway?') != QMessageBox.Yes: return
+        super().reject()
 
 
 class Window(QMainWindow):
