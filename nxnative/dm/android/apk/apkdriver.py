@@ -84,6 +84,25 @@ def with_activity(entries, dex):
     return out, activity
 
 
+def with_game_modes(entries):
+    """entries with Android's Battery and Performance game modes declared (axml.py GAME_MODE_CONFIG: the manifest's meta-data, resources.arsc's xml/game_mode_config
+    and its file), for a port made before mkapk.py wrote them: (entries, whether it changed). Only for an APK whose resources.arsc is exactly the icon table
+    mkapk.py writes (rebuilt here from the icon files the APK has): anything else is left as it is"""
+    from axml import GAME_MODE_CONFIG, GAME_MODE_XML, app_res_table, axml, decode, game_mode_id, has_game_modes, icon_drawables, manifest_with_game_modes, res_table
+    names = {n for n, _, _ in entries}; byname = {n: d for n, d, _ in entries}
+    tree = decode(byname['AndroidManifest.xml'])
+    if has_game_modes(tree): return entries, False
+    pkg = next(v for ns, n, v in tree[1] if n == 'package')
+    drawables = icon_drawables('res/drawable-nodpi-v4/icon_fg.png' in names) if 'res/drawable-nodpi-v4/icon.png' in names else []
+    if drawables and byname.get('resources.arsc') != res_table(pkg, [('drawable', drawables)]): raise SystemExit('resources.arsc: not the icon table mkapk.py writes: game modes not added')
+    if not drawables and 'resources.arsc' in names: raise SystemExit('resources.arsc without an icon: not an APK made by mkapk.py: game modes not added')
+    man = manifest_with_game_modes(byname['AndroidManifest.xml'], game_mode_id(drawables)); arsc = app_res_table(pkg, drawables)
+    out = [(n, man if n == 'AndroidManifest.xml' else arsc if n == 'resources.arsc' else d, a) for n, d, a in entries]
+    if 'resources.arsc' not in names: out.append(('resources.arsc', arsc, 4))
+    out.append((GAME_MODE_XML, axml(GAME_MODE_CONFIG), 4))
+    return out, True
+
+
 def rebuild_set(src, drivers, loader=(), host=None, assets=None):
     """src's entries with every driver library replaced by drivers ([(lib name, path)], in that order: the pause menu's Driver tab lists up to three) and loader
     (libadrenotools and its hooks, paths) added where src lacks them, so a port made without --vulkan-driver can take one: ([(name, data, align)], dropped names)"""
@@ -144,6 +163,7 @@ def main():
     p.add_argument('--loader', action='append', default=[], metavar='FILE', help='with --set-drivers: libadrenotools or one of its hooks, added when the APK lacks it')
     p.add_argument('--external-dex', metavar='DEX', help='the external-display activity (org.nx2a.ExternalActivity): its classes.dex goes in and the manifest names it; the rest stays')
     p.add_argument('--native-activity', action='store_true', help='Android\'s NativeActivity again: the external-display activity and its classes.dex go')
+    p.add_argument('--game-modes', action='store_true', help='with any of the above, or alone: Android\'s Battery and Performance game modes declared where the APK lacks them (porter host)')
     a = p.parse_args()
     if any('=' not in x or x.startswith('=') for x in a.asset): p.error('--asset takes NAME=FILE')
     assets = {n: f for n, _, f in (x.partition('=') for x in a.asset)}
@@ -160,9 +180,10 @@ def main():
         result = {'drivers': [x.split('=', 1)[0] for x in a.set_driver], 'dropped': dropped}
     else:
         if a.set_driver or a.loader: p.error('--set-driver and --loader go with --set-drivers')
-        if not (a.driver or a.system or a.host or a.asset): p.error('give --driver, --system, --host or --asset')
+        if not (a.driver or a.system or a.host or a.asset or a.game_modes): p.error('give --driver, --system, --host, --asset or --game-modes')
         entries, dropped, added = rebuild(a.src, None if a.system else a.driver or KEEP, a.host, assets)
         result = {'driver': added, 'dropped': dropped}
+    if a.game_modes: entries, result['game_modes_added'] = with_game_modes(entries)
     kj = json.load(open(a.key)); k = {n: int(v) for n, v in kj.items() if n != 'cert'}; crt = bytes.fromhex(kj['cert'])
     z, cd, eocd = build_zip(entries)
     open(a.out, 'wb').write(sign_v2(z, cd, eocd, k, crt))

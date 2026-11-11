@@ -297,7 +297,7 @@ def update(adb, package, jobs=os.cpu_count() or 8, folder='', force=False):
             from porter import tv
             try: tv_dex = ['--external-dex', str(tv.build_dex(Path(t) / 'java'))]
             except BuildError as e: say(f'[RED] {package}: its TV-mode activity stays as it is ({e})')
-        r = subprocess.run([sys.executable, str(DM / 'android/apk/apkdriver.py'), str(src), str(out), str(paths.signing_key()), '--host', str(so)] + fonts + tv_dex,
+        r = subprocess.run([sys.executable, str(DM / 'android/apk/apkdriver.py'), str(src), str(out), str(paths.signing_key()), '--host', str(so), '--game-modes'] + fonts + tv_dex,   # (game modes: a port made before they were declared gets them)
                            capture_output=True, text=True, errors='replace')
         if r.returncode: raise BuildError((r.stderr.strip() or r.stdout.strip()).splitlines()[-1])
         size = so.stat().st_size

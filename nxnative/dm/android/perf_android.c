@@ -49,16 +49,18 @@ static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONI
 // DM_GPU_TURBO=1 (live, read every 60 presents): Adreno's GPU at its highest clock (thermal limits still apply) through the KGSL property libadrenotools'
 // adrenotools_set_turbo sets: power control off on /dev/kgsl-3d0; 0 gives it back. A frame held at 30 fps lets the GPU governor lower the clock until the work
 // fills the frame, so its GPU time says little about what 60 would need. Any Vulkan driver on KGSL (Qualcomm's, Turnip)
+static _Atomic int g_turbo_force;   // Android's Performance game mode (front_android.c gm_apply): the GPU at its highest clock as DM_GPU_TURBO=1 would
+void dm_perf_set_gpu_turbo(int on) { atomic_store(&g_turbo_force, on != 0); }
 static void gpu_turbo(void) {
-    static int on;   // what was last set
-    const char *e = getenv("DM_GPU_TURBO"); int want = e && atoi(e) > 0;
-    if (want == on) return;
+    static int on, refused = -1;   // what was last set; the value the driver refused (not asked again until another is wanted)
+    const char *e = getenv("DM_GPU_TURBO"); int want = (e && atoi(e) > 0) || atomic_load(&g_turbo_force);
+    if (want == on || want == refused) return;
     struct { unsigned type; void *value; size_t size; } prop; uint32_t enable = !want;   // (kgsl.h kgsl_device_getproperty; KGSL_PROP_PWRCTRL 0xE: 0 = power control off)
     prop.type = 0xE; prop.value = &enable; prop.size = sizeof enable;
     int fd = open("/dev/kgsl-3d0", O_RDWR); int r = fd < 0 ? -1 : ioctl(fd, _IOW(0x09, 0x32, prop), &prop);   // IOCTL_KGSL_SETPROPERTY
     if (fd >= 0) close(fd);
-    if (r) { LOG("[RED] [perf] DM_GPU_TURBO=%d: the GPU's power control could not be set (%s)", want, strerror(errno)); return; }
-    on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
+    if (r) { refused = want; LOG("[RED] [perf] DM_GPU_TURBO=%d: the GPU's power control could not be set (%s)", want, strerror(errno)); return; }
+    on = want; refused = -1; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
 }
 
 static void hint_init(int64_t target) {

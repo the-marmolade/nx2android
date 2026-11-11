@@ -89,6 +89,9 @@ static _Atomic int g_set_prewarm = 2, g_set_ver;   // Shader prewarm (0 off, 1 b
 int dm_prewarm_mode(void) { return atomic_load(&g_set_prewarm); }
 // Tools: Heavy mode and MT replay for the next launch (-1 none chosen: env.txt's; *_run what this launch has), Battery saver (and the choices it replaced)
 static _Atomic int g_set_heavy = -1, g_set_mtr = -1, g_set_batt; static int g_heavy_run, g_mtr_run, g_batt_prev[3];
+// Android's game mode (GameManager, gm_watch): the mode applied (0 none, 2 Performance, 3 Battery) and the choices it replaced (settings.txt gamemode=), so a mode
+// left while the app was closed is undone at the next launch
+static int g_gm_mode, g_gm_prev_batt, g_gm_prev_fcap;
 void dm_perf_record_start(int seconds); int dm_perf_record_state(char *name, int cap); unsigned dm_perf_record_ver(void);   // perf_android.c
 static _Atomic int g_set_fcap, g_set_cont, g_set_ll;   // the Display tab: Frame rate (OVM_FCAPS' index, 0 Auto), the 120 Hz container, Low latency
 static _Atomic int g_set_aa;   // the Graphics tab: Anti-aliasing (0 off, 1 FXAA, 2 SMAA; settings.txt aa=), read by the present (gfx_vk_present.c)
@@ -148,6 +151,7 @@ static void settings_load(void) {
         else if (sscanf(line, "mtreplay=%d", &v) == 1) atomic_store(&g_set_mtr, v < 0 ? -1 : v != 0);
         else if (sscanf(line, "battery=%d", &v) == 1) atomic_store(&g_set_batt, v != 0);
         else if (!strncmp(line, "battery_prev=", 13)) { int a, b, c; if (sscanf(line + 13, "%d,%d,%d", &a, &b, &c) == 3) { g_batt_prev[0] = a & 3; g_batt_prev[1] = b != 0; g_batt_prev[2] = c != 0; } }
+        else if (!strncmp(line, "gamemode=", 9)) { int m, b, c; if (sscanf(line + 9, "%d,%d,%d", &m, &b, &c) == 3 && (m == 0 || m == 2 || m == 3)) { g_gm_mode = m; g_gm_prev_batt = b != 0; g_gm_prev_fcap = c & 3; } }
         else if (sscanf(line, "prewarm=%d", &v) == 1) atomic_store(&g_set_prewarm, v < 0 ? 0 : v > 2 ? 2 : v);
         else if (sscanf(line, "driver=%d", &v) == 1) atomic_store(&g_set_driver, v < 0 ? -1 : v);   // (checked against the list in drivers_init)
         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
@@ -178,6 +182,7 @@ static void settings_save_locked(void) {
     fprintf(f, "fpscap=%d\ncontainer=%d\nlowlatency=%d\naa=%d\nupscale=%d\n", OVM_FCAPS[atomic_load(&g_set_fcap) & 3], atomic_load(&g_set_cont), atomic_load(&g_set_ll),
             atomic_load(&g_set_aa), atomic_load(&g_set_up));
     fprintf(f, "resolution=%d\n", atomic_load(&g_set_res));
+    if (g_gm_mode) fprintf(f, "gamemode=%d,%d,%d\n", g_gm_mode, g_gm_prev_batt, g_gm_prev_fcap);
     for (int m = 0; m < 2; m++) if (atomic_load(&g_res_base[m][0])) fprintf(f, "resbase_%c=%ux%u\n", m ? 'd' : 'h', atomic_load(&g_res_base[m][0]), atomic_load(&g_res_base[m][1]));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
@@ -645,6 +650,45 @@ static void battery_saver(int on) {   // 30 fps, no container, no low latency; o
     atomic_store(&g_set_batt, on); atomic_fetch_add(&g_set_ver, 1);
     dm_perf_set_cap(OVM_FCAPS[atomic_load(&g_set_fcap) & 3]); dm_perf_set_container(atomic_load(&g_set_cont)); dm_perf_set_lowlat(atomic_load(&g_set_ll));
     LOG("[menu] battery saver %s", on ? "on: 30 fps, no 120 Hz container, no low latency" : "off: the earlier choices back"); settings_save();
+}
+// Android's game mode (Android 12+ GameManager.getGameMode; the game dashboard, or a device maker's tool such as the AYN Thor's game assistant, sets it per app):
+// Battery: the Battery saver (30 fps, no container, no low latency); Performance: Battery saver off, the frame rate on Auto, the GPU at its highest clock (as
+// DM_GPU_TURBO=1; thermal limits still apply); Standard: what it changed is put back, each only if it is still as the mode left it (a choice made in the pause
+// menu meanwhile stays). DM_GAMEMODE=0 (start-up): not followed
+void dm_perf_set_gpu_turbo(int on);   // perf_android.c
+static void gm_apply(int m) {   // 0 Standard (or no game mode), 2 Performance, 3 Battery
+    if (m == g_gm_mode) return;
+    if (g_gm_mode == 3 && !g_gm_prev_batt && atomic_load(&g_set_batt)) battery_saver(0);
+    if (g_gm_mode == 2) {
+        if (!atomic_load(&g_set_fcap) && g_gm_prev_fcap) { atomic_store(&g_set_fcap, g_gm_prev_fcap); dm_perf_set_cap(OVM_FCAPS[g_gm_prev_fcap]); }
+        if (g_gm_prev_batt && !atomic_load(&g_set_batt)) battery_saver(1);
+        dm_perf_set_gpu_turbo(0);
+    }
+    g_gm_prev_batt = atomic_load(&g_set_batt); g_gm_prev_fcap = atomic_load(&g_set_fcap) & 3;
+    if (m == 3) battery_saver(1);
+    if (m == 2) { if (atomic_load(&g_set_batt)) battery_saver(0); atomic_store(&g_set_fcap, 0); dm_perf_set_cap(OVM_FCAPS[0]); dm_perf_set_gpu_turbo(1); }
+    LOG("[perf] game mode %s", m == 3 ? "Battery: battery saver on" : m == 2 ? "Performance: battery saver off, frame rate Auto, the GPU at its highest clock" : "Standard: the choices it changed put back");
+    g_gm_mode = m; atomic_fetch_add(&g_set_ver, 1); settings_save();
+}
+static void *gm_watch(void *arg) {   // every 3 s: Android has no callback for a changed game mode (the app is not restarted)
+    JavaVM *vm = arg; JNIEnv *E = NULL; pthread_setname_np(pthread_self(), "gamemode");
+    const char *e = getenv("DM_GAMEMODE");
+    if (e && !atoi(e)) { LOG("[perf] game mode: not followed (DM_GAMEMODE=0)"); gm_apply(0); return NULL; }
+    if (!g_act || (*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) return NULL;
+    jobject gm = NULL; jmethodID get = NULL;
+    if (!(*E)->PushLocalFrame(E, 16)) {
+        jobject a = g_act->clazz; jmethodID gs = (*E)->GetMethodID(E, (*E)->GetObjectClass(E, a), "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jobject o = gs ? (*E)->CallObjectMethod(E, a, gs, (*E)->NewStringUTF(E, "game")) : NULL;
+        if (!jx(E) && o) { get = (*E)->GetMethodID(E, (*E)->GetObjectClass(E, o), "getGameMode", "()I"); if (jx(E)) get = NULL; if (get) gm = (*E)->NewGlobalRef(E, o); }
+        jx(E); (*E)->PopLocalFrame(E, NULL);
+    }
+    if (!gm) { LOG("[perf] game mode: no GameManager (Android 12 or later): the pause menu's choices only"); gm_apply(0); (*vm)->DetachCurrentThread(vm); return NULL; }
+    for (int last = -1;; sleep(3)) {
+        int v = (*E)->CallIntMethod(E, gm, get); if (jx(E)) v = 1;   // 0 unsupported, 1 Standard, 2 Performance, 3 Battery, 4 Custom (Android 14)
+        if (v != last) { LOG("[perf] Android's game mode for this app: %d (%s)", v, v == 2 ? "Performance" : v == 3 ? "Battery" : v == 4 ? "Custom: as Standard" : v == 1 ? "Standard" : "unsupported"); last = v; }
+        gm_apply(v == 2 || v == 3 ? v : 0);
+    }
+    return NULL;
 }
 int dm_tools_value(int item, char *v, int cap) {
     if (item == OVM_REC) { char nm[48]; int st = dm_perf_record_state(nm, sizeof nm);
@@ -1447,6 +1491,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }
+    { pthread_t w; if (!pthread_create(&w, NULL, gm_watch, act->vm)) pthread_detach(w); }   // (after settings_load: a mode applied at the last launch is known)
     LOG("NX2A host on Android: files %s, RomFS %s, saves %s", g_root, getenv("DM_ROMFS"), act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
     // The game's main thread: a 16 MB stack mapped here and handed over whole (pthread_attr_setstack), so the range pthread_getattr_np reports, which
