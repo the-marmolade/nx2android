@@ -68,7 +68,13 @@ struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatch
 // Shader misses, for the HUD and the frame recordings (dm_shader_stats): pipelines the replay built in place (the frame waited: count and time) and the ones
 // sent to the background builders (their draws left out until made). Prewarm's builds are not misses
 static _Atomic uint64_t g_shd_stall_n, g_shd_stall_ns, g_shd_bg;
-static void shd_stall(uint64_t ns) { atomic_fetch_add(&g_shd_stall_n, 1); atomic_fetch_add(&g_shd_stall_ns, ns); }
+static inline uint64_t tnow(void);
+static void shd_stall(uint64_t ns) {   // a pipeline the frame waited for (made on the replay thread); the totals logged at most every 30 s
+    uint64_t n = atomic_fetch_add(&g_shd_stall_n, 1) + 1, t = atomic_fetch_add(&g_shd_stall_ns, ns) + ns;
+    static uint64_t last; uint64_t now = tnow();
+    if (now - last >= 30000000000ull) { last = now; LOG("[vk] shader stalls so far: %llu pipelines the frame waited for, %.0f ms in all (%.1f ms each); %llu built in the background",
+                                                      (unsigned long long)n, t / 1e6, t / 1e6 / (double)n, (unsigned long long)atomic_load(&g_shd_bg)); }
+}
 void dm_shader_stats(uint64_t *stall_n, uint64_t *stall_ns, uint64_t *bg_n) { *stall_n = atomic_load(&g_shd_stall_n); *stall_ns = atomic_load(&g_shd_stall_ns); *bg_n = atomic_load(&g_shd_bg); }
 static inline uint64_t tnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 // The per-draw timers (about 10 a draw, ~3,000 draws a frame): the arm64 counter register read directly, a few ns against clock_gettime's ~20-40, in ns
@@ -895,6 +901,12 @@ typedef struct {
 } pkey;
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
+// gmode 1: linked from graphics pipeline library parts, the missing parts built; 2: linked only when every part is built already, else VK_NULL_HANDLE (gpl_link)
+static VkPipeline build_pipeline_g(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3], int gmode);
+static int gpl_fits(const pkey *k, vkshader_t *const stg[3]);
+static void gpl_optimize(const pkey *k);
+static void pipe_destroy(VkPipeline p);   // (a linked one leaves the linked set too)
+static _Atomic unsigned g_pipe_gen;   // turns over when a linked pipeline is replaced by its optimised one: the replay's last-pipeline shortcut is dropped
 static void pipe_record(const pkey *k);
 // The last key and its pipeline (the replay thread's only; pipelines are never dropped): runs of draws with one pipeline skip the 992-byte hash and the lock
 static pkey g_last_k; static VkPipeline g_last_p;
@@ -921,11 +933,14 @@ static void *async_pipe_thread(void *arg) {
         for (int s = 0; s < 3; s++) if (k.key[s] && !(s == 1 && k.raster_discard)) stg[s] = vk_shader(k.key[s], s);
         if (stg[0]) { VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
             for (int s = 0; s < 3; s++) if (stg[s]) { dsl[stg[s]->set] = stg[s]->dsl; if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1; }
-            uint64_t t0 = tick(); p = build_pipeline(&k, vk_pipeline_layout(dsl, nsets), stg);
-            { static int n; if (n++ < 6) VKLOG("pipeline built in the background in %.1f ms (shaders %016llx %016llx)", (tick() - t0) / 1e6, (unsigned long long)k.key[0], (unsigned long long)k.key[1]); } }
+            // with libraries: its parts are built (they serve the next pipelines that share them) and linked, the draw shown sooner; the optimised one follows
+            VkPipelineLayout lay = vk_pipeline_layout(dsl, nsets); int g = gpl_fits(&k, stg);
+            uint64_t t0 = tick(); p = g ? build_pipeline_g(&k, lay, stg, 1) : VK_NULL_HANDLE; if (!p || p == (void *)1) { g = 0; p = build_pipeline(&k, lay, stg); }
+            { static int n; if (n++ < 6) VKLOG("pipeline built in the background in %.1f ms%s (shaders %016llx %016llx)", (tick() - t0) / 1e6, g ? ", linked from its parts" : "", (unsigned long long)k.key[0], (unsigned long long)k.key[1]); }
+            if (g) gpl_optimize(&k); }
         pthread_mutex_lock(&g_pipe_mu);
         VkPipeline had = nvn_hm_get(&g_pipes, &k);
-        if (had && had != PIPE_PENDING) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); }   // a prewarm thread made it meanwhile (as graphics_pipeline does: the one in the table may be bound already, the new one goes)
+        if (had && had != PIPE_PENDING) { if (p != (void *)1) pipe_destroy(p); }   // a prewarm thread made it meanwhile (as graphics_pipeline does: the one in the table may be bound already, the new one goes)
         else { nvn_hm_put(&g_pipes, &k, p); if (p != (void *)1) pipe_record(&k); }
         pthread_mutex_unlock(&g_pipe_mu);
     }
@@ -946,17 +961,32 @@ static int async_pipe(const pkey *k) {   // 1: queued (the draw is left out); un
     return ok;
 }
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
+    { static unsigned gen; unsigned g = atomic_load_explicit(&g_pipe_gen, memory_order_relaxed); if (g != gen) { gen = g; g_last_p = VK_NULL_HANDLE; } }   // (an optimised one replaced a linked one)
     if (g_last_p && !memcmp(k, &g_last_k, sizeof *k)) return g_last_p == (void *)1 ? VK_NULL_HANDLE : g_last_p;
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k); pthread_mutex_unlock(&g_pipe_mu);
     if (p == PIPE_PENDING) return VK_NULL_HANDLE;
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
-    if (async_pipe(k)) return VK_NULL_HANDLE;
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
-    uint64_t tb = tick(); p = build_pipeline(k, layout, stg); uint64_t tc = tick() - tb; if (g_prof_on) g_prof_ns[0] += tc; g_vkst.pipes_built++;
+    // Graphics pipeline libraries: every part built already (an earlier pipeline shared them), the link takes about a millisecond and the draw is shown now,
+    // neither left out for the background nor compiled whole here; the optimised pipeline follows from the background
+    int g = gpl_fits(k, stg); uint64_t tb = tick();
+    if (g && (p = build_pipeline_g(k, layout, stg, 2)) && p != (void *)1) {
+        uint64_t tc = tick() - tb; if (g_prof_on) g_prof_ns[0] += tc; shd_stall(tc); gpl_optimize(k);
+        { static int n; if (n++ < 6) VKLOG("pipeline linked from its parts in %.2f ms (shaders %016llx %016llx)", tc / 1e6, (unsigned long long)k->key[0], (unsigned long long)k->key[1]); }
+        pthread_mutex_lock(&g_pipe_mu); VkPipeline had = nvn_hm_get(&g_pipes, k);
+        if (had && had != PIPE_PENDING) { pipe_destroy(p); p = had; } else { nvn_hm_put(&g_pipes, k, p); pipe_record(k); }
+        pthread_mutex_unlock(&g_pipe_mu);
+        g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p;
+    }
+    if (async_pipe(k)) return VK_NULL_HANDLE;
+    tb = tick(); p = g ? build_pipeline_g(k, layout, stg, 1) : VK_NULL_HANDLE;   // built here: with libraries its parts too, for the next pipelines that share them
+    if (!p || p == (void *)1) { g = 0; p = build_pipeline(k, layout, stg); }
+    else gpl_optimize(k);
+    uint64_t tc = tick() - tb; if (g_prof_on) g_prof_ns[0] += tc; g_vkst.pipes_built++;
     shd_stall(tc);
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
-    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
+    if (had) { if (p != (void *)1) pipe_destroy(p); p = had; }   // a prewarm thread made it meanwhile
     else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
     pthread_mutex_unlock(&g_pipe_mu);
     return p == (void *)1 ? VK_NULL_HANDLE : p;
@@ -1077,7 +1107,127 @@ static void build_dump(void) {   // (the crash handler: no locks, no allocation)
                 g_build[i].phase == 1 ? "making its shader modules" : "in the driver's pipeline compile", g_build[i].what); }
     if (!n) fprintf(stderr, "[dm] [vk] no pipeline was being built\n");
 }
-static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in[3]) {
+// ---- graphics pipeline libraries (VK_EXT_graphics_pipeline_library, V.has_gpl: Turnip; gfx_vk_core.c). A pipeline is four parts: the vertex input, the
+// pre-rasterisation (vertex and geometry shaders, viewport, rasteriser), the fragment shader (with depth, stencil and multisampling) and the fragment output (blending
+// and the targets' formats). Each part is built once and kept, by what it is made of (the shader module variants and the layout, not the whole pipeline key), so a
+// pipeline met for the first time whose parts an earlier one had is linked without optimisation in about a millisecond, where a whole compile takes 20-35 ms on
+// Adreno. The linked pipeline is used at once; one thread builds the optimised pipeline whole at low priority and swaps it in (gpl_opt_thread), the linked one
+// destroyed seconds later (a frame in flight may still use it). Not for rasterizer-discard or transform-feedback draws, debugging variants (debug_mode, alt) or
+// with neither a compatible render pass nor dynamic rendering: those are compiled whole as before.
+enum { GPL_VI, GPL_PRE, GPL_FS, GPL_FO };
+typedef struct { uint32_t n; uint8_t b[700]; } gplkey;   // a part's description, zero-filled (n past the end: does not fit, no library)
+static nvn_hmap g_gpl = {.klen = sizeof(gplkey)}, g_gpl_fast = {.klen = sizeof(VkPipeline)}; static pthread_mutex_t g_gpl_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_gpl_parts, g_gpl_links, g_gpl_opt;
+static void gk_add(gplkey *g, const void *p, size_t n) { if (g->n + n <= sizeof g->b) memcpy(g->b + g->n, p, n); g->n += (uint32_t)n; }
+#define GK(x) gk_add(&g, &(x), sizeof(x))
+static int gpl_fits(const pkey *k, vkshader_t *const stg[3]) {
+    return V.has_gpl && stg[0] && !k->raster_discard && !k->debug_mode && !k->alt && !stg[0]->xfb && !(stg[2] && stg[2]->xfb) && (V.has_dynrender || rp_on());
+}
+static VkPipeline gpl_part(int kind, gplkey *gk, const VkGraphicsPipelineCreateInfo *full, const void *rinfo, int only_built) {
+    if (gk->n > sizeof gk->b) return (VkPipeline)1;
+    pthread_mutex_lock(&g_gpl_mu); VkPipeline p = nvn_hm_get(&g_gpl, gk); pthread_mutex_unlock(&g_gpl_mu);
+    if (p || only_built) return p;
+    static const VkDynamicState d_pre[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH},
+        d_fs[] = {VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE}, d_fo[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    static const VkGraphicsPipelineLibraryFlagsEXT FL[4] = {VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+                                                            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
+    VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, kind == GPL_VI ? NULL : (void *)rinfo, FL[kind]};
+    VkGraphicsPipelineCreateInfo c = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &li, VK_PIPELINE_CREATE_LIBRARY_BIT_KHR};
+    c.basePipelineIndex = -1;
+    VkPipelineShaderStageCreateInfo ss[3]; uint32_t ns = 0;
+    for (uint32_t i = 0; i < full->stageCount; i++) if ((kind == GPL_PRE && full->pStages[i].stage != VK_SHADER_STAGE_FRAGMENT_BIT) || (kind == GPL_FS && full->pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)) ss[ns++] = full->pStages[i];
+    if (kind == GPL_VI) { c.pVertexInputState = full->pVertexInputState; c.pInputAssemblyState = full->pInputAssemblyState; }
+    if (kind == GPL_PRE) { c.stageCount = ns; c.pStages = ss; c.pViewportState = full->pViewportState; c.pRasterizationState = full->pRasterizationState; dy.dynamicStateCount = 4; dy.pDynamicStates = d_pre; }
+    if (kind == GPL_FS) { c.stageCount = ns; c.pStages = ns ? ss : NULL; c.pDepthStencilState = full->pDepthStencilState; c.pMultisampleState = full->pMultisampleState; dy.dynamicStateCount = 3; dy.pDynamicStates = d_fs; }
+    if (kind == GPL_FO) { c.pColorBlendState = full->pColorBlendState; c.pMultisampleState = full->pMultisampleState; dy.dynamicStateCount = 1; dy.pDynamicStates = d_fo; }
+    if (kind != GPL_VI) { c.pDynamicState = &dy; c.renderPass = full->renderPass; }
+    if (kind == GPL_PRE || kind == GPL_FS) c.layout = full->layout;
+    VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &c, NULL, &p);
+    vk_pipeline_cache_changed();
+    if (r) { static int n; if (n++ < 8) VKLOG("[RED] [vk] pipeline library part %d failed (%d): that pipeline is compiled whole", kind, r); p = (VkPipeline)1; }
+    pthread_mutex_lock(&g_gpl_mu); VkPipeline had = nvn_hm_get(&g_gpl, gk);
+    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; } else { nvn_hm_put(&g_gpl, gk, p); if (p != (void *)1) atomic_fetch_add(&g_gpl_parts, 1); }
+    pthread_mutex_unlock(&g_gpl_mu);
+    return p;
+}
+// the pipeline linked from its parts (1 failed: compile it whole; VK_NULL_HANDLE with only_built when a part is not built yet)
+static VkPipeline gpl_link(const pkey *k, const VkGraphicsPipelineCreateInfo *ci, const VkPipelineRenderingCreateInfo *rci, int only_built) {
+    gplkey g; VkPipeline lib[4];
+    VkShaderModule mod[3] = {0}; const void *pin[3] = {0};   // (the stages' modules: the variant of each shader this pipeline uses)
+    for (uint32_t i = 0; i < ci->stageCount; i++) { int s = ci->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT ? 0 : ci->pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? 1 : 2; mod[s] = ci->pStages[i].module; pin[s] = ci->pStages[i].pNext; }
+    uint32_t clip = k->clip_neg1 && V.has_depth_clip_ctl, kind; VkRenderPass rp = ci->renderPass; VkPipelineLayout lay = ci->layout;
+    #define GK_TARGETS() do { GK(rp); GK(k->ncol); gk_add(&g, k->cfmt, sizeof *k->cfmt * k->ncol); GK(k->dfmt); GK(k->samples); } while (0)
+    memset(&g, 0, sizeof g); kind = GPL_VI; GK(kind); GK(k->topo); GK(k->restart); GK(k->nattr); gk_add(&g, k->attr, sizeof *k->attr * k->nattr); GK(k->nbind); gk_add(&g, k->bind, sizeof *k->bind * k->nbind);
+    if (!(lib[0] = gpl_part(GPL_VI, &g, ci, rci, only_built)) || lib[0] == (void *)1) return lib[0];
+    memset(&g, 0, sizeof g); kind = GPL_PRE; GK(kind); GK(mod[0]); GK(mod[2]); GK(pin[0]); GK(pin[2]); GK(lay); GK_TARGETS();
+    GK(clip); GK(k->depth_clamp); GK(k->mode); GK(k->cull); GK(k->front); GK(k->bias_en);
+    if (!(lib[1] = gpl_part(GPL_PRE, &g, ci, rci, only_built)) || lib[1] == (void *)1) return lib[1];
+    memset(&g, 0, sizeof g); kind = GPL_FS; GK(kind); GK(mod[1]); GK(pin[1]); GK(lay); GK_TARGETS(); GK(k->a2c);
+    GK(k->dt); GK(k->dw); GK(k->df); GK(k->st); GK(k->sf); GK(k->sfail); GK(k->szfail); GK(k->szpass);
+    if (!(lib[2] = gpl_part(GPL_FS, &g, ci, rci, only_built)) || lib[2] == (void *)1) return lib[2];
+    memset(&g, 0, sizeof g); kind = GPL_FO; GK(kind); GK_TARGETS(); GK(k->a2c); GK(k->blend_en); GK(k->logic_en); GK(k->logic_op);
+    gk_add(&g, k->wmask, sizeof *k->wmask * k->ncol); gk_add(&g, k->bl, sizeof *k->bl * k->ncol);
+    if (!(lib[3] = gpl_part(GPL_FO, &g, ci, rci, only_built)) || lib[3] == (void *)1) return lib[3];
+    #undef GK_TARGETS
+    VkPipelineLibraryCreateInfoKHR ll = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, NULL, 4, lib};
+    VkGraphicsPipelineCreateInfo lc = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ll}; lc.layout = lay; lc.basePipelineIndex = -1;
+    VkPipeline p; VkResult r = vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &lc, NULL, &p);
+    if (r) { static int n; if (n++ < 8) VKLOG("[RED] [vk] pipeline link failed (%d): compiled whole", r); return (VkPipeline)1; }
+    pthread_mutex_lock(&g_gpl_mu); nvn_hm_put(&g_gpl_fast, &p, (void *)1); pthread_mutex_unlock(&g_gpl_mu);
+    uint64_t c = atomic_fetch_add(&g_gpl_links, 1) + 1;
+    if (c % 200 == 0) VKLOG("pipeline libraries: %llu pipelines linked from %llu parts, %llu optimised", (unsigned long long)c, (unsigned long long)atomic_load(&g_gpl_parts), (unsigned long long)atomic_load(&g_gpl_opt));
+    return p;
+}
+#undef GK
+// The optimised pipelines: one thread below the game's, a queue of keys; the linked pipeline each replaces is destroyed 5 s later (gpl_old), by then no frame uses it
+static pkey g_opq[APQ]; static int g_opq_h, g_opq_t, g_opq_on; static pthread_mutex_t g_opq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_opq_cv = PTHREAD_COND_INITIALIZER;
+enum { GPL_OLD = 512 };
+static struct { VkPipeline p; uint64_t t; } g_gpl_old[GPL_OLD]; static int g_gpl_old_h, g_gpl_old_t;
+static void pipe_destroy(VkPipeline p) { pthread_mutex_lock(&g_gpl_mu); nvn_hm_del(&g_gpl_fast, &p); pthread_mutex_unlock(&g_gpl_mu); vkDestroyPipeline(V.dev, p, NULL); }
+static int gpl_is_fast(VkPipeline p) { pthread_mutex_lock(&g_gpl_mu); int f = p && p != (void *)1 && p != PIPE_PENDING && nvn_hm_get(&g_gpl_fast, &p); pthread_mutex_unlock(&g_gpl_mu); return f; }
+static void gpl_old_drop(int all) {   // (the optimiser thread's)
+    while (g_gpl_old_t != g_gpl_old_h && (all || tick() - g_gpl_old[g_gpl_old_t % GPL_OLD].t > 5000000000ull)) {
+        VkPipeline p = g_gpl_old[g_gpl_old_t % GPL_OLD].p; g_gpl_old_t++;
+        pthread_mutex_lock(&g_gpl_mu); nvn_hm_del(&g_gpl_fast, &p); pthread_mutex_unlock(&g_gpl_mu);
+        vkDestroyPipeline(V.dev, p, NULL);
+    }
+}
+static void *gpl_opt_thread(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk pipe optimise"); setpriority(PRIO_PROCESS, 0, 10);
+    for (;;) {
+        pthread_mutex_lock(&g_opq_mu);
+        while (g_opq_h == g_opq_t) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1; pthread_cond_timedwait(&g_opq_cv, &g_opq_mu, &ts);
+            if (g_opq_h == g_opq_t && g_gpl_old_t != g_gpl_old_h) { pthread_mutex_unlock(&g_opq_mu); gpl_old_drop(0); pthread_mutex_lock(&g_opq_mu); } }
+        pkey k = g_opq[g_opq_t % APQ]; g_opq_t++; pthread_mutex_unlock(&g_opq_mu);
+        gpl_old_drop(0);
+        pthread_mutex_lock(&g_pipe_mu); VkPipeline cur = nvn_hm_get(&g_pipes, &k); pthread_mutex_unlock(&g_pipe_mu);
+        if (cur && cur != PIPE_PENDING && !gpl_is_fast(cur)) continue;   // optimised already (the prewarm, an earlier request)
+        vkshader_t *stg[3] = {0};
+        for (int s = 0; s < 3; s++) if (k.key[s] && !(s == 1 && k.raster_discard)) stg[s] = vk_shader(k.key[s], s);
+        if (!stg[0]) continue;
+        VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
+        for (int s = 0; s < 3; s++) if (stg[s]) { dsl[stg[s]->set] = stg[s]->dsl; if (stg[s]->set + 1 > nsets) nsets = stg[s]->set + 1; }
+        VkPipeline p = build_pipeline(&k, vk_pipeline_layout(dsl, nsets), stg);
+        if (p == (void *)1) continue;   // the linked one stays
+        pthread_mutex_lock(&g_pipe_mu); VkPipeline old = nvn_hm_get(&g_pipes, &k);
+        int fast = gpl_is_fast(old);
+        if (old && old != PIPE_PENDING && !fast) { pthread_mutex_unlock(&g_pipe_mu); vkDestroyPipeline(V.dev, p, NULL); continue; }
+        nvn_hm_put(&g_pipes, &k, p); atomic_fetch_add(&g_pipe_gen, 1);
+        pthread_mutex_unlock(&g_pipe_mu);
+        atomic_fetch_add(&g_gpl_opt, 1);
+        if (fast) { if (g_gpl_old_h - g_gpl_old_t >= GPL_OLD) gpl_old_drop(1); g_gpl_old[g_gpl_old_h % GPL_OLD].p = old; g_gpl_old[g_gpl_old_h % GPL_OLD].t = tick(); g_gpl_old_h++; }
+    }
+    return NULL;
+}
+static void gpl_optimize(const pkey *k) {
+    pthread_mutex_lock(&g_opq_mu);
+    if (!g_opq_on) { g_opq_on = 1; pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, gpl_opt_thread, NULL); pthread_attr_destroy(&a); }
+    if (g_opq_h - g_opq_t < APQ) { g_opq[g_opq_h % APQ] = *k; g_opq_h++; pthread_cond_signal(&g_opq_cv); }   // (a full queue: that one stays linked)
+    pthread_mutex_unlock(&g_opq_mu);
+}
+static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in[3]) { return build_pipeline_g(k, layout, stg_in, 0); }
+static VkPipeline build_pipeline_g(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg_in[3], int gmode) {
     VkPipeline p; vkshader_t *stg[3] = {stg_in[0], stg_in[1], stg_in[2] ? vk_shader_gs_topo(stg_in[2], (VkPrimitiveTopology)k->topo) : NULL};
     int bs = build_begin();
     if (bs >= 0) { snprintf(g_build[bs].what, sizeof g_build[bs].what, "graphics pipeline, shaders %016llx %016llx %016llx; topology %u, polygon mode %u, samples %u, "
@@ -1136,6 +1286,13 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkRenderPass prp = rp_on() ? rp_compat(k->ncol, k->cfmt, k->dfmt, k->samples) : VK_NULL_HANDLE;   // with render passes, pipelines are made against a compatible one
     if (!prp && !V.has_dynrender) { build_end(bs); return (VkPipeline)1; }   // no compatible render pass and no dynamic rendering: no valid pipeline (pass_commit skips such passes)
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, ns, ss, &vi, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, layout, prp, 0, VK_NULL_HANDLE, -1};
+    if (gmode) {   // from library parts (gpl_link): 1 failed, VK_NULL_HANDLE a part not built (gmode 2); the caller then compiles it whole
+        if (bs >= 0) g_build[bs].phase = 2;
+        p = gpl_link(k, &ci, prp ? NULL : &rci, gmode == 2);
+        build_end(bs);
+        if (p && p != (void *)1) __atomic_add_fetch(&g_vkst.pipes_built, 1, __ATOMIC_RELAXED);
+        return p;
+    }
     if (bs >= 0) g_build[bs].phase = 2;
     VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
     vk_pipeline_cache_changed();

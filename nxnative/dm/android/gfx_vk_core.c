@@ -252,7 +252,8 @@ void vk_init(void) {
     VkPhysicalDeviceDepthClipControlFeaturesEXT fdc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT, &fr2};
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT, &fdc};
     VkPhysicalDeviceTransformFeedbackFeaturesEXT fxf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, &fu8};
-    VkPhysicalDeviceFeatures2 fx = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fxf};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, &fxf};
+    VkPhysicalDeviceFeatures2 fx = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fgpl};
     vkGetPhysicalDeviceFeatures2(V.pd, &fx);
     // transform feedback (NVN BeginTransformFeedback; gfx_vk_exec.c xfb_*): Xenoblade Chronicles 3 captures particle state with it
     V.has_xfb = fxf.transformFeedback && has_ext(ex, ne, "VK_EXT_transform_feedback"); fxf.geometryStreams = 0;
@@ -261,9 +262,19 @@ void vk_init(void) {
     V.has_robust2 = fr2.nullDescriptor && has_ext(ex, ne, "VK_EXT_robustness2");
     V.has_depth_clip_ctl = fdc.depthClipControl && has_ext(ex, ne, "VK_EXT_depth_clip_control");
     V.has_dtiming = has_ext(ex, ne, "VK_GOOGLE_display_timing");   // frame pacing on the display (gfx_vk_present.c pace_*)
-    // (not used yet: whether this driver could build pipelines from precompiled parts, which would make a shader miss cost a link rather than a whole compile)
-    VKLOG("[vk] shader paths: graphics pipeline library %s, shader objects %s", has_ext(ex, ne, "VK_EXT_graphics_pipeline_library") ? "yes" : "no",
-          has_ext(ex, ne, "VK_EXT_shader_object") ? "yes" : "no");
+    // Graphics pipeline libraries: a pipeline met for the first time is linked from parts already built (vertex input, the vertex and geometry shaders, the fragment
+    // shader, the colour output) in about a millisecond rather than compiled whole (20-35 ms on Adreno), and the optimised one built in the background replaces it
+    // (gfx_vk_exec.c gpl_link). Only with fast linking: a driver whose link is a compile of its own gains nothing. Turnip has it; Qualcomm's driver has no extension.
+    // DM_VK_GPL=0 (start-up): pipelines are compiled whole as before
+    { VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+      int ext = has_ext(ex, ne, "VK_EXT_graphics_pipeline_library") && has_ext(ex, ne, "VK_KHR_pipeline_library");
+      if (ext) { VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gp}; vkGetPhysicalDeviceProperties2(V.pd, &p2); }
+      const char *e = getenv("DM_VK_GPL"); int off = e && !atoi(e);
+      V.has_gpl = ext && fgpl.graphicsPipelineLibrary && gp.graphicsPipelineLibraryFastLinking && !off && non + 2 <= 64;
+      if (V.has_gpl) { on[non++] = "VK_KHR_pipeline_library"; on[non++] = "VK_EXT_graphics_pipeline_library"; }
+      VKLOG("[vk] shader paths: graphics pipeline library %s, shader objects %s", !ext ? "no" : V.has_gpl ? "yes, fast linking: new pipelines are linked from their parts"
+            : off ? "yes, off (DM_VK_GPL=0)" : !gp.graphicsPipelineLibraryFastLinking ? "yes, without fast linking: not used" : "listed, feature off: not used",
+            has_ext(ex, ne, "VK_EXT_shader_object") ? "yes" : "no"); }
     V.has_bc = ff.features.textureCompressionBC; V.has_astc = ff.features.textureCompressionASTC_LDR; V.has_gs = ff.features.geometryShader;
     { const char *e = getenv("DM_VK_X_BC_CPU"); if (e && atoi(e)) V.has_bc = 0; }   // (start-up) BC textures decoded on the CPU as on a device without them (gfx_vk_tex.c bc_decode)
     V.max_aniso = V.props.limits.maxSamplerAnisotropy;
@@ -293,6 +304,7 @@ void vk_init(void) {
     fxf.pNext = &fu8;
     VkBaseOutStructure *t = ff.pNext; while (t->pNext) t = t->pNext;   // the queried chain (core / promoted features), then the extensions'
     t->pNext = V.has_xfb ? (VkBaseOutStructure *)&fxf : (VkBaseOutStructure *)&fu8;
+    if (V.has_gpl) { fgpl.pNext = t->pNext; t->pNext = (VkBaseOutStructure *)&fgpl; }   // (only graphicsPipelineLibrary: it is the struct's one member)
     VkPhysicalDeviceFeatures2 enf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, ff.pNext, en};
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.qf, 1, &prio};
