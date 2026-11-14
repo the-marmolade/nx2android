@@ -288,26 +288,31 @@ def cmd_saves(a):
 
 def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt without the game files
     import contextlib
-    from porter import config, driver, host, saves, toolchain, tv
+    from porter import config, driver, host, paths, saves, toolchain, tv
     from porter.upstream import BuildError
     try:
         with contextlib.redirect_stdout(sys.stderr if a.json else sys.stdout):   # with --json, stdout is the one JSON document
             cfg = config.load(); adb = saves.connect(toolchain.find_adb(cfg), a.device or cfg.get('device'))
-            if a.cmd == 'driver': out = driver.swap(adb, saves.pick_app(adb, a.package), None if a.system else a.library)
-            elif a.cmd == 'tv':
-                pkg = saves.pick_app(adb, a.package); out = tv.status(adb, pkg) if a.mode == 'status' else tv.set_mode(adb, pkg, a.mode == 'on')
-            elif a.cmd == 'host': out = host.update(adb, saves.pick_app(adb, a.package), a.jobs, folder=a.folder, force=a.force)
-            else:   # updates
-                folders = {k.upper(): v for k, v in (f.split('=', 1) for f in a.folder if '=' in f)}
-                out = {'version': host.checkout_version(), 'games': []}
-                for pkg in saves.apps(adb):
-                    try:
-                        r = host.inspect(adb, pkg)
-                        if r.get('title_id') in folders: r = host.inspect(adb, pkg, folders[r['title_id']])
-                    except BuildError as e: r = {'package': pkg, 'name': pkg, 'status': 'port', 'reason': str(e)}
-                    try: r['tv'] = tv.status(adb, pkg)['tv']
-                    except BuildError: r['tv'] = False
-                    out['games'].append(r)
+            reinstalls = a.cmd in ('driver', 'host') or (a.cmd == 'tv' and a.mode != 'status')
+            lock = adb.hold(paths.user_dir()) if reinstalls else None   # they reinstall the APK: not while porter install runs on the device
+            try:
+                if a.cmd == 'driver': out = driver.swap(adb, saves.pick_app(adb, a.package), None if a.system else a.library)
+                elif a.cmd == 'tv':
+                    pkg = saves.pick_app(adb, a.package); out = tv.status(adb, pkg) if a.mode == 'status' else tv.set_mode(adb, pkg, a.mode == 'on')
+                elif a.cmd == 'host': out = host.update(adb, saves.pick_app(adb, a.package), a.jobs, folder=a.folder, force=a.force)
+                else:   # updates
+                    folders = {k.upper(): v for k, v in (f.split('=', 1) for f in a.folder if '=' in f)}
+                    out = {'version': host.checkout_version(), 'games': []}
+                    for pkg in saves.apps(adb):
+                        try:
+                            r = host.inspect(adb, pkg)
+                            if r.get('title_id') in folders: r = host.inspect(adb, pkg, folders[r['title_id']])
+                        except BuildError as e: r = {'package': pkg, 'name': pkg, 'status': 'port', 'reason': str(e)}
+                        try: r['tv'] = tv.status(adb, pkg)['tv']
+                        except BuildError: r['tv'] = False
+                        out['games'].append(r)
+            finally:
+                if lock: lock.close()
     except BuildError as e:
         if a.json: _print_json({'error': str(e)})
         else: print(e, file=sys.stderr)

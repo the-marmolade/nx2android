@@ -301,7 +301,7 @@ static VkFramebuffer fb_get(const fbkey *k) {
     pthread_mutex_unlock(&g_rp_mu); return fb;
 }
 // the attachments begin_pass found, for the render pass begin: each colour slot's (and the depth's) image, view, view format and layers, size at the view's level
-static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h; } P_att[9];
+static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h, bc_lv, bc_ly, bc_nly; } P_att[9];   // (bc_*: a block-compressed image's stand-in, the level and layers this pass draws)
 
 // Before a pass that goes on with a depth buffer (loads it), one texel of its depth is copied out: a transfer read makes Adreno's driver drop the buffer's
 // low-resolution depth (LRZ), which it otherwise kept from earlier passes even within one command buffer. NEO's menu → field wipe drew whole 32x32 squares of
@@ -585,10 +585,42 @@ static void lin_back(void) {
         { static int n; if (n++ < 4) VKLOG("linear render target %ux%u (nvn format %#x, stride %zu) copied back to its storage %p", im->w, im->h, t->d.format, stride, (void *)t->mem); }
     }
 }
+// A block-compressed image's stand-in (gfx_vk_tex.c vk_tex_view_as) and the image: the region of one level and its layers (a 3D image's depth slices), in blocks
+// for the stand-in and in texels for the image, for the copies through a buffer in either direction. The buffer holds the blocks row by row as both read them
+static int bc_region(const vkimg_t *d, uint32_t lv, uint32_t ly, uint32_t n, VkBufferImageCopy *rd, VkBufferImageCopy *rp, VkDeviceSize *bytes) {
+    const vkimg_t *p = d->bc_of; const vkfmt_t *uf = vk_fmt(d->nvn_format); if (!p || !uf) return 0;
+    int is3d = p->vtype == VK_IMAGE_VIEW_TYPE_3D; if (!n) n = 1;
+    uint32_t bw = d->w >> lv ? d->w >> lv : 1, bh = d->h >> lv ? d->h >> lv : 1, pw = p->w >> lv ? p->w >> lv : 1, ph = p->h >> lv ? p->h >> lv : 1;
+    *rd = (VkBufferImageCopy){0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, lv, is3d ? 0 : ly, is3d ? 1 : n}, {0, 0, is3d ? (int32_t)ly : 0}, {bw, bh, is3d ? n : 1}};
+    *rp = *rd; rp->imageExtent.width = pw; rp->imageExtent.height = ph;
+    *bytes = (VkDeviceSize)bw * bh * uf->bpb * n; return 1;
+}
+// Before a pass that draws into a stand-in: the level and layers it draws, copied from the image (image → buffer → stand-in), so that what the pass does not cover
+// keeps the image's blocks when bc_draw_back copies them back. A new image (never used: its blocks undefined) leaves the stand-in as it is
+static void bc_fill(vkimg_t *d, uint32_t lv, uint32_t ly, uint32_t n) {
+    vkimg_t *p = d->bc_of; VkBufferImageCopy rd, rp; VkDeviceSize bytes; VkBuffer sb; VkDeviceSize so;
+    if (!p || p->layout == VK_IMAGE_LAYOUT_UNDEFINED || !bc_region(d, lv, ly, n, &rd, &rp, &bytes) || !vk_scratch(bytes, 16, &sb, &so)) return;
+    rd.bufferOffset = rp.bufferOffset = so;
+    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+    vkCmdCopyImageToBuffer(cb, p->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &rp); vk_img_barrier_all(cb);
+    vkCmdCopyBufferToImage(cb, sb, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rd); vk_img_barrier_all(cb);
+}
+// After a pass that drew into a stand-in: the level and layers it drew, copied into the image as blocks through scratch memory (stand-in → buffer → image, the
+// second copy as an upload's)
+static void bc_draw_back(void) {
+    for (int i = 0; i < 8; i++) { vkimg_t *d = P_att[i].im; if (!d || !d->bc_of) continue;
+        vkimg_t *p = d->bc_of; VkBufferImageCopy rd, rp; VkDeviceSize bytes; VkBuffer sb; VkDeviceSize so;
+        if (!bc_region(d, P_att[i].bc_lv, P_att[i].bc_ly, P_att[i].bc_nly, &rd, &rp, &bytes) || !vk_scratch(bytes, 16, &sb, &so)) continue;
+        rd.bufferOffset = rp.bufferOffset = so;
+        VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, p); vk_img_barrier_all(cb);
+        vkCmdCopyImageToBuffer(cb, d->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &rd); vk_img_barrier_all(cb);
+        vkCmdCopyBufferToImage(cb, sb, p->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rp); vk_img_barrier_all(cb);
+        p->gpu_w = 1; }
+}
 void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); list_reads("it"); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
-    if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+    if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); bc_draw_back(); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_tf_in_pass = 0;
@@ -629,11 +661,13 @@ static int begin_pass(void) {
         // a block-compressed texture drawn into through an uncompressed view (RGBA32UI over BC3: one texel per 4x4 block, Mario Kart 8 Deluxe compressing its
         // reflection cubemaps on the GPU) is that view's size in blocks: with the texel size the render area was 16 times the attachment, which Vulkan does not allow (the render area must lie within every attachment view)
         { const vkfmt_t *tf = vk_fmt(S.rt_col[i].d.format), *vf = S.rt_has_cview[i] && S.rt_cview[i].set_format ? vk_fmt(S.rt_cview[i].format) : tf;
-          if (tf && vf && tf->compressed && !tf->dec && !vf->compressed && tf->bw && tf->bh) { iw = (iw + tf->bw - 1) / tf->bw; ih = (ih + tf->bh - 1) / tf->bh;
+          if (tf && vf && tf->compressed && !tf->dec && !vf->compressed && tf->bw && tf->bh) { if (!im->bc_of) { iw = (iw + tf->bw - 1) / tf->bw; ih = (ih + tf->bh - 1) / tf->bh; }   // (a stand-in is in blocks already: vk_tex_view_as)
               static int said; if (!said++) VKLOG("colour target: block-compressed format %#x drawn through view format %#x: pass in blocks, %ux%u", S.rt_col[i].d.format, S.rt_cview[i].format, iw, ih); } }
         if (iw < w) w = iw; if (ih < h) h = ih; samples = im->samples; have = 1;
         ca[i].imageView = v; S.cfmt[i] = vk_view_fmt; ncol = i + 1; P_att[i].im = im;   // (the view's format: a render pass's attachment and its pipelines take it)
         P_att[i].fmt = vk_view_fmt; P_att[i].layers = vk_view_layers ? vk_view_layers : 1; P_att[i].w = iw; P_att[i].h = ih;
+        P_att[i].bc_lv = im->bc_lv; P_att[i].bc_ly = im->bc_ly; P_att[i].bc_nly = im->bc_nly;
+        if (im->bc_of) bc_fill(im, im->bc_lv, im->bc_ly, im->bc_nly);   // (before the pass begins: what it does not cover keeps the image's blocks)
         if (P_att[i].layers < layers) layers = P_att[i].layers;
     }
     for (int i=0;i<8;i++) P_alias_views[i]=ca[i].imageView;
@@ -1418,14 +1452,15 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
         vkimg_t *im = NULL; ii->imageView = vf ? vk_tex_view_as(t, v, b->dim, b->flags & 1, 0, &im, vf) : vk_tex_view(t, v, b->dim, b->flags & 1, 0, &im); if (storage && im) im->gpu_w = 1;
         if (vf && ii->imageView && vk_view_fmt == vf) { static int once; if (!once++) VKLOG("storage image: nvn format %#x viewed as vk %d for a %s image binding", t->d.format, vf, sc == 1 ? "uint" : "int"); }
         if (logfs) nlogfs++;
-        if (g_tracing || logfs) VKLOG("  %stexture binding %d handle %#llx id %d: %ux%u nvn format %#x target %d serial %llu pool %p+%#llx size %#llx → image %p (%ux%u fmt %d layers %u levels %u, gpu-written %d) view %p", logfs ? "logfs " : "", b->binding, (unsigned long long)h, tid, t->d.width, t->d.height, t->d.format, t->d.target,
-                             (unsigned long long)t->serial, (const void *)t->pool, (unsigned long long)t->off, (unsigned long long)t->L.size, (void *)im, im ? im->w : 0, im ? im->h : 0, im ? im->fmt : 0, im ? im->layers : 0, im ? im->levels : 0, im ? (int)im->gpu_w : -1, (void *)ii->imageView);
+        if (g_tracing || logfs) VKLOG("  %stexture binding %d handle %#llx id %d: %ux%u nvn format %#x target %d serial %llu pool %p+%#llx size %#llx (mem %p, flags %#x, pool flags %#x, packaged layout %d) → image %p (%ux%u fmt %d layers %u levels %u, gpu-written %d) view %p", logfs ? "logfs " : "", b->binding, (unsigned long long)h, tid, t->d.width, t->d.height, t->d.format, t->d.target,
+                             (unsigned long long)t->serial, (const void *)t->pool, (unsigned long long)t->off, (unsigned long long)t->L.size, (const void *)t->mem, (unsigned)t->d.flags, t->pool ? (unsigned)t->pool->flags : 0u, (int)t->has_layout, (void *)im, im ? im->w : 0, im ? im->h : 0, im ? im->fmt : 0, im ? im->layers : 0, im ? im->levels : 0, im ? (int)im->gpu_w : -1, (void *)ii->imageView);
         if (im) im->last_use = mtl_last_fence() + 1;
         if (ii->imageView) num = view_num(t, v);
         if (ii->imageView) { g_tvc[ck].epoch = g_set_epoch; g_tvc[ck].gen = g_tex_gen; g_tvc[ck].tid = tid; g_tvc[ck].dim = b->dim; g_tvc[ck].arr = b->flags & 1; g_tvc[ck].v = ii->imageView; g_tvc[ck].im = im; g_tvc[ck].num = num; g_tvc[ck].sc = sc; }
     }
     if (num && !storage) ii->sampler = samp_for(st, b, h, 1);
     if (!ii->imageView) {
+        if (g_tracing) VKLOG("  texture binding %d handle %#llx id %d: no texture (%s) → a dummy view", b->binding, (unsigned long long)h, tid, !tid ? "ID 0" : g_var_now == 3 ? "variant 3" : !t ? "the ID is not registered" : "no view");
         const vkfmt_t *f = t ? vk_fmt(t->d.format) : NULL;
         ii->imageView = vk_dummy_view(b->dim == 0xff ? 1 : b->dim, b->flags & 1, (b->flags & 2) != 0, storage, f && f->is_int); num = f && f->is_int ? (f->is_sint ? 2 : 1) : 0;
     }
@@ -1582,7 +1617,9 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             } else bi[nw] = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536};
             break; }
         case RK_TEX: case RK_TEX_UBO: case RK_TEX_C2A: {
-            int cnt = b->count ? b->count : 32; if (nii + (uint32_t)cnt > sizeof ii / sizeof *ii) cnt = 1;
+            int cnt = b->count ? b->count : 32;
+            // Twelve 32-entry arrays fill ii; even a scalar after them needs a capacity check, never a truncated write.
+            if (nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("[RED] [vk] image descriptor array exceeds capacity");
             for (int k = 0; k < cnt; k++) {
                 uint64_t h = b->kind == RK_TEX ? vk_tex_slot_handle(S.tex[st], S.img[st], (unsigned)b->reg) :
                              b->kind == RK_TEX_UBO ? mem_handle(ubo_word(st, b->reg, b->off + 8 * k)) : (b->off >= 0 ? c2_handle(st, b->off + 8 * k) : 0);
@@ -1594,7 +1631,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             continue; }
         case RK_TEXD: case RK_SAMPD: {
             int cnt = b->count ? b->count : 32;
-            if (cnt > 32 || nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("dynamic texture array exceeds capacity");
+            if (cnt > 32 || nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("[RED] [vk] dynamic texture array exceeds capacity");
             for (int k = 0; k < cnt; k++) {
                 VkDescriptorImageInfo *di = &ii[nii + k]; memset(di, 0, sizeof *di);
                 if (b->kind == RK_SAMPD) {
@@ -1623,6 +1660,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
             nw++; continue;
         }
         case RK_IMG: case RK_IMG_UBO: {
+            if (nii >= sizeof ii / sizeof *ii) die("[RED] [vk] storage image descriptor exceeds capacity");
             uint64_t h = b->kind == RK_IMG ? (b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0) : mem_handle(ubo_word(st, b->reg, b->off));
             tex_desc_for(st, b, h, &ii[nii], 1); wr->pImageInfo = &ii[nii++]; wr->descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; nw++;
             continue; }
@@ -1639,8 +1677,10 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs, VkDescri
         default: {   // unknown: the descriptor type it was declared with, filled with what reads zero
             if (b->desc == RD_UBO || b->desc == RD_SSBO) bi[nw] = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536};
             else if (b->desc == RD_SAMPLED || b->desc == RD_STORAGE) {
+                int cnt = b->count ? b->count : 32;
+                if (nii + (uint32_t)cnt > sizeof ii / sizeof *ii) die("[RED] [vk] fallback image descriptor array exceeds capacity");
                 ii[nii] = (VkDescriptorImageInfo){b->desc == RD_SAMPLED ? vk_dummy_sampler() : VK_NULL_HANDLE, vk_dummy_view(b->dim == 0xff ? 1 : b->dim, b->flags & 1, (b->flags & 2) != 0, b->desc == RD_STORAGE, 0), VK_IMAGE_LAYOUT_GENERAL};
-                int cnt = b->count ? b->count : 32; for (int k = 1; k < cnt && nii + k < sizeof ii / sizeof *ii; k++) ii[nii + k] = ii[nii];
+                for (int k = 1; k < cnt; k++) ii[nii + k] = ii[nii];
                 wr->pImageInfo = &ii[nii]; nii += (uint32_t)cnt; wr->descriptorCount = (uint32_t)cnt;
                 wr->descriptorType = b->desc == RD_SAMPLED ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; nw++; continue;
             } else if (b->desc == RD_TBUF || b->desc == RD_STORAGE_TBUF) { bv[nw] = vk_dummy_tbuf(b->desc == RD_STORAGE_TBUF); wr->pTexelBufferView = &bv[nw];
@@ -2480,6 +2520,7 @@ static int depth_scale(VkCommandBuffer cb, vkimg_t *s, vkimg_t *d, VkImageSubres
     S.bound_pipe = VK_NULL_HANDLE;   // the compute pipeline took the bind point the replay's dispatches use
     return 1;
 }
+enum { CF_MIRROR_X = 4, CF_MIRROR_Y = 8 };   // NVNcopyFlags (copy_t2t)
 static void copy_t2t(const p_copy_t2t *c) {
     vk_end_pass();
     vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
@@ -2492,6 +2533,11 @@ static void copy_t2t(const p_copy_t2t *c) {
     int32_t sw = (int32_t)(s->w >> ss.mipLevel ? s->w >> ss.mipLevel : 1), sh = (int32_t)(s->h >> ss.mipLevel ? s->h >> ss.mipLevel : 1);
     int32_t dw = (int32_t)(d->w >> ds.mipLevel ? d->w >> ds.mipLevel : 1), dh = (int32_t)(d->h >> ds.mipLevel ? d->h >> ds.mipLevel : 1);
     p_copy_t2t k = *c; c = &k; d->gpu_w = 1;
+    // NVNcopyFlags: LINEAR_FILTER 1, ENGINE_2D 2 (nothing to do here), MIRROR_X 4, MIRROR_Y 8, MIRROR_Z 0x10: a mirrored copy is a blit with the destination's offsets
+    // swapped. Pokémon Sword 1.3.2 captures its picture for a door's fade with MIRROR_Y (its lower-left origin image turned over) and draws it back; copied
+    // unmirrored, the fade showed the room upside down for 7 frames (Odin 2, 2026-11-13)
+    int mir = (int)(k.flags & (CF_MIRROR_X | CF_MIRROR_Y));
+    if (k.flags & ~(DM_COPY_RESOLVE | 1u | 2u | CF_MIRROR_X | CF_MIRROR_Y)) VKRED_ONCE(77, "texture copy flags %#x: mirror Z (or an unknown bit) not done", k.flags & ~DM_COPY_RESOLVE);
     if (k.sr.height <= 0) k.sr.height = 1; if (k.dr.height <= 0) k.dr.height = 1;
     if (ss.mipLevel >= s->levels || ds.mipLevel >= d->levels || k.sr.xoffset < 0 || k.sr.yoffset < 0 || k.dr.xoffset < 0 || k.dr.yoffset < 0 || k.sr.xoffset >= sw || k.sr.yoffset >= sh || k.dr.xoffset >= dw || k.dr.yoffset >= dh) {
         VKRED_ONCE(72, "texture copy outside its images (src %dx%d @%d,%d of %dx%d level %u, dst %dx%d @%d,%d of %dx%d level %u): skipped", c->sr.width, c->sr.height, c->sr.xoffset, c->sr.yoffset, sw, sh, ss.mipLevel,
@@ -2511,25 +2557,27 @@ static void copy_t2t(const p_copy_t2t *c) {
         if (rs != rd) { static int n; if (n++ < 8) VKLOG("render scale: copy %ux%u (factor %.3f) → %ux%u (factor %.3f): a blit", s->w, s->h, rs, d->w, d->h, rd); }
         if (k.sr.width <= 0 || k.sr.height <= 0 || k.dr.width <= 0 || k.dr.height <= 0) { vk_img_barrier_all(cb); return; }
     }
-    if (!(c->flags & DM_COPY_RESOLVE) && !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt)) {   // a blit: both formats must allow it (and linear filtering)
+    if (!(c->flags & DM_COPY_RESOLVE) && (mir || !(k.sr.width == k.dr.width && k.sr.height == k.dr.height && s->fmt == d->fmt))) {   // a blit: both formats must allow it (and linear filtering)
         VkFormatProperties sp, dp; vkGetPhysicalDeviceFormatProperties(V.pd, s->fmt, &sp); vkGetPhysicalDeviceFormatProperties(V.pd, d->fmt, &dp);
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(dp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) || (s->aspect != d->aspect)) {
             if (depth_scale(cb, s, d, ss, ds, &k)) return;
             VKRED_ONCE(75, "texture blit between formats %d → %d that cannot be blitted (%dx%d → %dx%d, present %llu): skipped", s->fmt, d->fmt, k.sr.width, k.sr.height, k.dr.width, k.dr.height, (unsigned long long)g_tex_frame); vk_img_barrier_all(cb); return; }
         if (!(sp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || (s->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) k.flags &= ~1u;   // nearest where linear is not allowed
     }
-    if (s == d && !memcmp(&ss, &ds, sizeof ss) && k.sr.xoffset == k.dr.xoffset && k.sr.yoffset == k.dr.yoffset && k.sr.width == k.dr.width && k.sr.height == k.dr.height && k.sr.zoffset == k.dr.zoffset) {
+    if (!mir && s == d && !memcmp(&ss, &ds, sizeof ss) && k.sr.xoffset == k.dr.xoffset && k.sr.yoffset == k.dr.yoffset && k.sr.width == k.dr.width && k.sr.height == k.dr.height && k.sr.zoffset == k.dr.zoffset) {
         vk_img_barrier_all(cb); return; }   // a copy of a region onto itself (two textures over the same storage): nothing to do, and Vulkan forbids overlapping copies
     if (c->flags & DM_COPY_RESOLVE) {
         VkImageResolve r = {ss, {c->sr.xoffset, c->sr.yoffset, 0}, ds, {c->dr.xoffset, c->dr.yoffset, 0}, {(uint32_t)c->sr.width, (uint32_t)c->sr.height, 1}};
         vkCmdResolveImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-    } else if (c->sr.width == c->dr.width && c->sr.height == c->dr.height && s->fmt == d->fmt) {
+    } else if (!mir && c->sr.width == c->dr.width && c->sr.height == c->dr.height && s->fmt == d->fmt) {
         VkImageCopy r = {ss, {c->sr.xoffset, c->sr.yoffset, s->layers > 1 ? 0 : c->sr.zoffset}, ds, {c->dr.xoffset, c->dr.yoffset, d->layers > 1 ? 0 : c->dr.zoffset},
                          {(uint32_t)c->sr.width, (uint32_t)(c->sr.height ? c->sr.height : 1), s->layers > 1 ? 1 : (uint32_t)(c->sr.depth ? c->sr.depth : 1)}};
         vkCmdCopyImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     } else {
         VkImageBlit r = {ss, {{c->sr.xoffset, c->sr.yoffset, 0}, {c->sr.xoffset + c->sr.width, c->sr.yoffset + (c->sr.height ? c->sr.height : 1), 1}},
                          ds, {{c->dr.xoffset, c->dr.yoffset, 0}, {c->dr.xoffset + c->dr.width, c->dr.yoffset + (c->dr.height ? c->dr.height : 1), 1}}};
+        if (mir & CF_MIRROR_X) { int32_t x = r.dstOffsets[0].x; r.dstOffsets[0].x = r.dstOffsets[1].x; r.dstOffsets[1].x = x; }
+        if (mir & CF_MIRROR_Y) { int32_t y = r.dstOffsets[0].y; r.dstOffsets[0].y = r.dstOffsets[1].y; r.dstOffsets[1].y = y; }
         vkCmdBlitImage(cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r, (c->flags & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     vk_img_barrier_all(cb);
@@ -2655,7 +2703,9 @@ static void exec_ops(const uint8_t *p) {
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_RESET_COUNTER: break;
-        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = mtl_last_fence() + 1; s->fenced = 1; break; }
+        case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8);
+            if (!sync_replay_fence(s, mtl_last_fence() + 1)) { static int n; if (n++ < 4) VKLOG("fence on sync %p skipped: the game has finalized or freed it (nvn_obj.h sync_replay_fence)", (void *)s); }
+            break; }
         // (DM_VK_TRACE_PASS=-2 lists the buffer writes too: copies, clears and uniform updates, by address)
         case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s_, d, n);
             if (g_x_tracepass == -2 || mdi_log_now()) VKLOG("--- copy %#llx → %#llx, %llu bytes, after pass %d", (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n, g_sub_pass - 1); break; }

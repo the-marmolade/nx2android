@@ -197,6 +197,10 @@ NVN(nvnDeviceInstallDebugCallback, void, NVNdevice *d, const PFNNVNDEBUGCALLBACK
 }
 NVN(nvnDeviceSetWindowOriginMode, void, NVNdevice *d, NVNwindowOriginMode m) { ((dev_t_ *)d)->origin = m; mtl_set_origin_lower_left(m == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT); LOG("[nvn] window origin %s", m ? "upper left (as D3D / Metal)" : "lower left (GL)"); }
 NVN(nvnDeviceSetDepthMode, void, NVNdevice *d, NVNdepthMode m) { ((dev_t_ *)d)->depth_mode = m; mtl_set_depth_zero(m != 0); LOG("[nvn] depth mode %s", m ? "near=0 (as D3D / Metal)" : "near=-w (GL)"); }
+// The modes the device was set to, as the setters keep them. Mega Man Battle Network Legacy Collection Vol. 1 sets the upper-left origin and reads it back: the unimplemented getter's 0
+// (lower left, GL) made it draw its render-to-texture menu layers flipped, a mirrored copy of the menu over the top of the screen; Pokémon Sword 1.3.2 asks for both right after creating its device
+NVN(nvnDeviceGetWindowOriginMode, NVNwindowOriginMode, const NVNdevice *d) { return (NVNwindowOriginMode)((const dev_t_ *)d)->origin; }
+NVN(nvnDeviceGetDepthMode, NVNdepthMode, const NVNdevice *d) { return (NVNdepthMode)((const dev_t_ *)d)->depth_mode; }
 NVN(nvnDeviceFinalizeCommandHandle, void, NVNdevice *d, NVNcommandHandle h) { (void)d; (void)h; }
 
 // ---------- Memory pools ----------
@@ -513,13 +517,15 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     // issue #80). Such a texture is CPU-written (uploaded from memory at its first use) when its storage holds anything; render targets, images, video, display, linear and
     // sparse textures are left out, so are virtual pools (their pages exist only where mapped, and their content is the mapping's), and so is memory that looks all zero (a
     // texture the GPU fills later). The look reads the first 64 KB and then 64 bytes of each 4 KB page: a texture that is all zero, re-initialized every frame, stays cheap
-    if (!o->has_layout && !s->pkg_data && o->mem && o->pool && (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && !(o->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) &&
+    // With the profile's tex_cpu_uncached, a CPU-uncached pool counts too: the CPU writes it with no flush to see, so data there at creation is the CPU's as well. Cardfight!!
+    // Vanguard Dear Days 2 fills its UI label atlas (1024x512 RGBA8, flags 0) before making the texture over it: as a GPU texture of zeros, every card's ability tabs were missing
+    if (!o->has_layout && !s->pkg_data && o->mem && o->pool && ((o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) || (DM_GAME_TEX_CPU_UNCACHED && (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED))) && !(o->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) &&
         o->d.target != NVN_TEXTURE_TARGET_BUFFER && !(o->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE | NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE |
                                                                    NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) {
         size_t i = 0, n = o->L.size, head = n < 65536 ? n : 65536; int data = 0;
         for (; i < head && !data; i++) data = o->mem[i] != 0;
         for (size_t pg = head; pg < n && !data; pg += 4096) for (size_t k = pg; k < pg + 64 && k < n && !data; k++) data = o->mem[k] != 0;
-        if (data) { mtl_tex_cpu_written(o); static int nl; if (nl++ < 8) LOG("[nvn] texture %ux%ux%u format %#x target %d (no packaged layout) holds data at creation in a CPU-inaccessible pool: uploaded from memory", o->d.width, o->d.height, o->d.depth, o->d.format, o->d.target); }
+        if (data) { mtl_tex_cpu_written(o); static int nl; if (nl++ < 8) LOG("[nvn] texture %ux%ux%u format %#x target %d (no packaged layout) holds data at creation in a pool %s: uploaded from memory", o->d.width, o->d.height, o->d.depth, o->d.format, o->d.target, (o->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ? "the CPU cannot access" : "the CPU writes uncached (tex_cpu_uncached)"); }
     }
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
@@ -1265,7 +1271,8 @@ static void *replay_main(void *arg) {
         if (j.kind == JOB_SUBMIT) { uint64_t ts = now_ns(); __atomic_store_n(&g_replaying, g_job_done + 1, __ATOMIC_RELAXED); submit_now(j.q, j.n, (const NVNcommandHandle *)j.h); __atomic_store_n(&g_replaying, 0, __ATOMIC_RELAXED);
             static nvn_job prev; if (prev.h) { for (int i = 0; i < prev.n; i++) free((void *)(uintptr_t)prev.h[i]); free(prev.h); }   // the copies (rec_copy) go one submission later
             prev = j; g_tl_enq = j.t_enq; g_tl_start = ts; g_tl_end = now_ns(); }
-        else { gfx_enter(); uint64_t t0 = now_ns(); uint64_t tk = mtl_present(j.tex, j.period, j.crop); __atomic_store_n(j.ticket, tk, __ATOMIC_RELEASE); gfx_leave(); atomic_fetch_add(&g_nvn_ns, now_ns() - t0); }
+        else { dm_perf_replay_thread();   // (again while its cores were refused: perf_android.c)
+            gfx_enter(); uint64_t t0 = now_ns(); uint64_t tk = mtl_present(j.tex, j.period, j.crop); __atomic_store_n(j.ticket, tk, __ATOMIC_RELEASE); gfx_leave(); atomic_fetch_add(&g_nvn_ns, now_ns() - t0); }
         pthread_mutex_lock(&g_job_mu);
         memmove(g_jobs, g_jobs + 1, sizeof *g_jobs * (size_t)--g_njob); g_job_done++; g_job_fence[g_job_done % JOB_RING] = mtl_last_fence();
         pthread_cond_broadcast(&g_jobdone_cv); pthread_mutex_unlock(&g_job_mu);

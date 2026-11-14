@@ -47,6 +47,8 @@ void front_screen_match(int fps) { (void)fps; }
 
 // ---------------- the app ----------------
 static ANativeActivity *g_act;
+static jmethodID g_audio_menu_method;
+int dm_menu_audio_available(void) { return g_audio_menu_method != NULL; }
 AAssetManager *dm_front_assets(void) { return g_act ? g_act->assetManager : NULL; }   // the APK's assets (overlay_theme.c: the gamepad's theme)
 static pthread_mutex_t g_win_mu = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *g_win, *g_external_win;
@@ -126,8 +128,9 @@ int dm_res_value(char *v, int cap) {   // gfx_vk_present.c: the row's value; 1 w
 void dm_perf_set_cap(int fps); void dm_perf_set_container(int on); void dm_perf_set_lowlat(int on);   // perf_android.c
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
-// and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
-static _Atomic int g_cust[2][2][DM_AOV_N][3], g_cust_ver, g_edit;
+// and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
+#define CUST_K 4
+static _Atomic int g_cust[2][2][DM_AOV_N][CUST_K], g_cust_ver, g_edit;
 static const char *const LAYOUT_NAMES[2] = {"tablet", "phone"};
 static int ctl_named(const char *n) { for (int i = 0; i < OV_N; i++) if (!strcmp(OV_LAYOUTS[0][i].name, n)) return i; return -1; }
 int dm_opmode(void); void dm_set_opmode(int m);   // hle_oe.c: 0 handheld, 1 docked; a change reaches the game as the Switch's operation mode notification
@@ -155,13 +158,14 @@ static void settings_load(void) {
         else if (sscanf(line, "prewarm=%d", &v) == 1) atomic_store(&g_set_prewarm, v < 0 ? 0 : v > 2 ? 2 : v);
         else if (sscanf(line, "driver=%d", &v) == 1) atomic_store(&g_set_driver, v < 0 ? -1 : v);   // (checked against the list in drivers_init)
         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
-        else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
-            char lay[16], name[32]; int x, y, z, l, i;
-            if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d", lay, name, &x, &y, &z) != 5 || (i = ctl_named(name)) < 0) continue;
+        else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>[,<hidden>]: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
+            char lay[16], name[32]; int x, y, z, hid = 0, l, i;
+            if (sscanf(line + 3, "%15[^,],%31[^,],%d,%d,%d,%d", lay, name, &x, &y, &z, &hid) < 5 || (i = ctl_named(name)) < 0) continue;
             for (l = 0; l < 2 && strcmp(lay, LAYOUT_NAMES[l]); l++) {}
             if (l == 2) continue;
             if (x >= 0 && x <= 10000 && y >= 0 && y <= 10000) { atomic_store(&g_cust[0][l][i][0], x + 1); atomic_store(&g_cust[0][l][i][1], y + 1); }
             if (z >= OVE_SCALE_MIN * 1000 && z <= OVE_SCALE_MAX * 1000) atomic_store(&g_cust[0][l][i][2], z);
+            if (hid == 1 && OV_LAYOUTS[l][i].kind != OV_MENU) atomic_store(&g_cust[0][l][i][3], 1);
         } else if (sscanf(line, "menu_x=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][0], v + 1); }   // before
         else if (sscanf(line, "menu_y=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][1], v + 1); }   // the editor
     }
@@ -186,8 +190,8 @@ static void settings_save_locked(void) {
     for (int m = 0; m < 2; m++) if (atomic_load(&g_res_base[m][0])) fprintf(f, "resbase_%c=%ux%u\n", m ? 'd' : 'h', atomic_load(&g_res_base[m][0]), atomic_load(&g_res_base[m][1]));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
-        _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
-        if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);
+        _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
+        if ((x && y) || z || hid) fprintf(f, "ui=%s,%s,%d,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000, hid);
     }
     fclose(f); rename(tmp, p);
 }
@@ -214,8 +218,10 @@ static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchan
 // The game goes to the background when the activity stops (no longer seen), not when it pauses: an activity paused while still on screen (Android's MTP
 // helper opening and closing in a tenth of a second when a USB-C video adapter connects, its hub a USB device) had the graphics suspended and the audio
 // stream closed and opened again, a second's stutter each time a television was plugged in
+void dm_perf_gpu_release(void);   // perf_android.c: the GPU's clock control back to its governor (DM_GPU_TURBO)
+// The clock control goes back after go_background: its dm_gfx_suspend waits for the presents in progress, and one of them could otherwise set the GPU's power control again
 static void on_pause(ANativeActivity *a) { (void)a; }
-static void on_stop(ANativeActivity *a) { (void)a; go_background(); }
+static void on_stop(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu_release(); }
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
@@ -263,7 +269,7 @@ static void act_finish(ANativeActivity *a) {
     if (!m || (*E)->ExceptionCheck(E)) { (*E)->ExceptionClear(E); LOG("[RED] Activity.finish() failed: the app ends itself"); _exit(0); }
 }
 static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } go_foreground(); }
-static void on_destroy(ANativeActivity *a) { (void)a; _exit(0); }   // one game per process
+static void on_destroy(ANativeActivity *a) { (void)a; dm_perf_gpu_release(); _exit(0); }   // one game per process
 
 // ---- input ----
 static AInputQueue *g_queue; static ALooper *g_ilooper;
@@ -308,7 +314,9 @@ JNIEXPORT jboolean JNICALL Java_org_nx2a_ExternalActivity_externalTouch(JNIEnv *
 JNIEXPORT jboolean JNICALL Java_org_nx2a_ExternalActivity_externalControllerKey(JNIEnv *env, jclass cls, jobject event) { (void)cls; return external_event(env, event, 1, 0); }
 JNIEXPORT jboolean JNICALL Java_org_nx2a_ExternalActivity_externalControllerMotion(JNIEnv *env, jclass cls, jobject event) { (void)cls; return external_event(env, event, 0, 0); }
 void dm_audio_route_device(int32_t id);
+int32_t dm_aaudio_get_device(void);
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalAudio(JNIEnv *env, jclass cls, jint id) { (void)env; (void)cls; dm_audio_route_device(id); }
+JNIEXPORT jint JNICALL Java_org_nx2a_ExternalActivity_externalAudioSelected(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_aaudio_get_device(); }
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalHaptic(JNIEnv *env, jclass cls) { (void)env; (void)cls; dm_haptics_android_tap(); }
 JNIEXPORT void JNICALL Java_org_nx2a_ExternalActivity_externalInput(JNIEnv *env, jclass cls, jlong buttons, jint lx, jint ly, jint rx, jint ry, jboolean menu) {
     (void)env; (void)cls;
@@ -385,6 +393,8 @@ int dm_overlay_custom(int layout, int ctl, float *x, float *y, float *s) {   // 
     *x = (cx - 1) / 10000.0f; *y = (cy - 1) / 10000.0f; return 1;
 }
 int dm_overlay_custom_ver(void) { return atomic_load(&g_cust_ver); }
+int dm_overlay_hidden(int layout, int ctl) { return layout >= 0 && layout <= 1 && ctl >= 0 && ctl < OV_N && atomic_load(&g_cust[atomic_load(&g_edit) ? 1 : 0][layout][ctl][3]); }
+int dm_overlay_off(int layout, int ctl) { return !atomic_load(&g_edit) && dm_overlay_hidden(layout, ctl); }
 float dm_overlay_opacity(void) { return atomic_load(&g_set_opacity) / 100.0f; }
 static void cust_place(int set, int l, int i, float x, float y) { atomic_store(&g_cust[set][l][i][0], 1 + (int)lroundf(x * 10000)); atomic_store(&g_cust[set][l][i][1], 1 + (int)lroundf(y * 10000)); }
 int64_t dm_overlay_pressed(int ctl, uint64_t bit) {
@@ -421,7 +431,8 @@ JNIEXPORT jfloatArray JNICALL Java_org_nx2a_ExternalActivity_externalOverlay(JNI
         if (c->kind == OV_DPAD) { for (int d = 0; d < 4; d++) if (dm_overlay_pressed(i, OV_DPAD_BITS[d])) held |= 1u << d; }
         else if (dm_overlay_pressed(i, 0)) held = 1;
         jfloat *v = &values[4 + i * 9];
-        v[0] = c->kind; v[1] = b[0]; v[2] = b[1]; v[3] = b[2]; v[4] = b[3]; v[5] = (jfloat)held; v[6] = kx; v[7] = ky; v[8] = ov_cscale(c);
+        // v[0] = -1: hidden by the player (ExternalActivity draws nothing of it)
+        v[0] = ov_off(c) ? -1 : c->kind; v[1] = b[0]; v[2] = b[1]; v[3] = b[2]; v[4] = b[3]; v[5] = (jfloat)held; v[6] = kx; v[7] = ky; v[8] = ov_cscale(c);
     }
     values[4 + OV_N * 9] = dm_overlay_visible();
     jfloatArray out = (*env)->NewFloatArray(env, (jsize)(5 + OV_N * 9));
@@ -434,6 +445,7 @@ static int ctl_at(float x, float y, float W, float H) {   // the control under (
     if (!vis) return -1;   // no overlay: every touch is the game's
     for (int i = 0; i < OV_N; i++) {
         const ov_ctl *c = &OV_CTLS[i]; if (!shown && c->kind != OV_MENU) continue;   // hidden: only the menu button answers
+        if (ov_off(c)) continue;   // hidden by the player in the layout editor
         float b[4]; ov_box(c, W, H, b);
         float d = ov_sdf(c, b, x - b[0], y - b[1]), reach = ov_reach(c, b, H), m = fminf(b[2], b[3]);
         if (d < reach && (d + m) / (m + reach) < bd) { bd = (d + m) / (m + reach); best = i; }   // between two, the one the touch is deeper into, for its size
@@ -713,6 +725,17 @@ static void game_quit(void) {
 static void driver_quit(void) { LOG("[menu] Quit for the driver %s", g_drv_name[atomic_load(&g_set_driver) < 0 ? g_drv_run : atomic_load(&g_set_driver)]); game_quit(); }
 static void menu_tab(int t) { t = (t % OVM_TABS + OVM_TABS) % OVM_TABS; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
 static void ed_open(void); static void sp_open(void); static void save_export(void);
+static void menu_audio(void) {
+    if (!g_act || !g_act->vm || !g_act->clazz || !g_audio_menu_method) return;
+    JNIEnv *e = NULL; int attached = 0;
+    if ((*g_act->vm)->GetEnv(g_act->vm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*g_act->vm)->AttachCurrentThread(g_act->vm, &e, NULL) != JNI_OK) return;
+        attached = 1;
+    }
+    (*e)->CallVoidMethod(e, g_act->clazz, g_audio_menu_method);
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); LOG("[menu] audio selection is unavailable"); }
+    if (attached) (*g_act->vm)->DetachCurrentThread(g_act->vm);
+}
 static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
@@ -741,6 +764,7 @@ static void menu_do(int item) {
     else if (item == OVM_DRUN) return;   // (a note: the driver this launch runs on)
     else if (item == OVM_DQUIT) { dm_haptics_android_tap(); driver_quit(); return; }
     else if (item == OVM_QUIT) { dm_haptics_android_tap(); LOG("[menu] Quit game"); game_quit(); return; }   // (the game's own save is the game's: nothing is written for it here)
+    else if (item == OVM_AUDIO) { menu_audio(); }
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
 }
@@ -915,15 +939,16 @@ int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
 // Save keeps the editor's layout (settings.txt, the next start too) and Cancel throws it away, asking first when something changed. Either goes back to the
 // menu. A controller: + saves, B cancels; in the prompt A throws away and B goes back to editing. It edits the layout in use (tablet or phone) ----
 static struct { int ptr, ptr2, sel, held, prompt, dirty, bdown, bar; float gx, gy, d0, s0; } g_ed = {-1, -1, -1, -1};   // bar: ptr went down on the toolbar or prompt
-static void ed_publish(void) { atomic_store(&g_ed_st, g_ed.prompt | g_ed.dirty << 1 | (atomic_load(&g_set_grid) ? OVE_GRID_ON : 0) | (g_ed.held + 1) << 4 | (g_ed.sel + 1) << 8); dm_overlay_redraw(); }
+static void ed_publish(void) { int hid = g_ed.sel >= 0 && atomic_load(&g_cust[1][dm_overlay_layout()][g_ed.sel][3]);
+    atomic_store(&g_ed_st, g_ed.prompt | g_ed.dirty << 1 | (atomic_load(&g_set_grid) ? OVE_GRID_ON : 0) | (hid ? OVE_SEL_HIDDEN : 0) | (g_ed.held + 1) << 4 | (g_ed.sel + 1) << 8); dm_overlay_redraw(); }
 static void ed_open(void) {
-    for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) for (int k = 0; k < 3; k++) atomic_store(&g_cust[1][l][i][k], atomic_load(&g_cust[0][l][i][k]));
+    for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) for (int k = 0; k < CUST_K; k++) atomic_store(&g_cust[1][l][i][k], atomic_load(&g_cust[0][l][i][k]));
     g_ed.ptr = g_ed.ptr2 = g_ed.sel = g_ed.held = g_ed.bdown = -1; g_ed.prompt = g_ed.dirty = g_ed.bar = 0; g_menu_ptr = -1;
     atomic_store(&g_edit, 1); atomic_fetch_add(&g_cust_ver, 1); ed_publish();
     LOG("[overlay] layout editor opened (%s layout)", LAYOUT_NAMES[dm_overlay_layout()]);
 }
 static void ed_close(int save) {
-    if (save) for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) for (int k = 0; k < 3; k++) atomic_store(&g_cust[0][l][i][k], atomic_load(&g_cust[1][l][i][k]));
+    if (save) for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) for (int k = 0; k < CUST_K; k++) atomic_store(&g_cust[0][l][i][k], atomic_load(&g_cust[1][l][i][k]));
     atomic_store(&g_edit, 0); atomic_fetch_add(&g_cust_ver, 1); g_menu_ptr = -1; atomic_store(&g_menu_hi, -1);
     if (save) settings_save();
     dm_haptics_android_tap(); dm_overlay_redraw();
@@ -936,7 +961,12 @@ static void ed_do(int b) {
     int l = dm_overlay_layout();
     if (b == OVE_SMALLER || b == OVE_BIGGER) { float f = b == OVE_BIGGER ? 1.1f : 1 / 1.1f; for (int i = 0; i < OV_N; i++) if (g_ed.sel < 0 || i == g_ed.sel) ed_resize(l, i, ed_size(l, i) * f);
         atomic_fetch_add(&g_cust_ver, 1); }
-    else if (b == OVE_RESET) { for (int i = 0; i < OV_N; i++) for (int k = 0; k < 3; k++) atomic_store(&g_cust[1][l][i][k], 0); g_ed.sel = -1; g_ed.dirty = 1; atomic_fetch_add(&g_cust_ver, 1); }
+    else if (b == OVE_RESET) { for (int i = 0; i < OV_N; i++) for (int k = 0; k < CUST_K; k++) atomic_store(&g_cust[1][l][i][k], 0); g_ed.sel = -1; g_ed.dirty = 1; atomic_fetch_add(&g_cust_ver, 1); }
+    else if (b == OVE_HIDE) {   // the chosen control hidden in play, or shown again (the menu button stays: it opens this editor)
+        if (g_ed.sel < 0 || OV_LAYOUTS[l][g_ed.sel].kind == OV_MENU) { ed_publish(); return; }
+        _Atomic int *h = &g_cust[1][l][g_ed.sel][3]; atomic_store(h, !atomic_load(h)); g_ed.dirty = 1; atomic_fetch_add(&g_cust_ver, 1);
+        LOG("[overlay] %s %s", OV_LAYOUTS[l][g_ed.sel].name, atomic_load(h) ? "hidden" : "shown again");
+    }
     else if (b == OVE_GRID) { atomic_store(&g_set_grid, !atomic_load(&g_set_grid)); settings_save(); }   // a setting, saved now: Cancel does not undo it
     else if (b == OVE_CANCEL) { ed_cancel(); return; }
     else if (b == OVE_SAVE) { ed_close(1); return; }
@@ -1197,7 +1227,7 @@ static int handle_event(AInputEvent *e) {
                 seen[k >> 3] |= (uint8_t)(1 << (k & 7)); LOG("[input] controller key %d (device %d): not mapped", k, AInputEvent_getDeviceId(e)); }
             return 0;
         }
-        pad_mark_used(AInputEvent_getDeviceId(e));
+        if (down) pad_mark_used(AInputEvent_getDeviceId(e));   // a release after a touch must not hide the controls again
         if (atomic_load(&g_menu)) { if (down && AKeyEvent_getRepeatCount(e) == 0) menu_key(bit); return 1; }
         if (down) g_btn |= bit; else if (AKeyEvent_getAction(e) == AKEY_EVENT_ACTION_UP) g_btn &= ~bit;
         dm_pad_players(1); pad_publish(); return 1;
@@ -1389,6 +1419,7 @@ static void *host_thread(void *a) {
     atomic_store(&g_running, 1);
     int rc = main(2, argv);
     LOG("host returned %d", rc);
+    dm_perf_gpu_release();   // the game ended itself: the device-wide KGSL property outlives the process (perf_android.c)
     _exit(rc);
 }
 static void env_file(const char *path) {   // KEY=VALUE per line (# comments): switches without rebuilding, as the iOS app's Documents/env.txt
@@ -1457,6 +1488,11 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     ANativeActivity_setWindowFlags(act, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
     g_sdk = sdk; hide_system_bars(act);
     static int started; if (started++) return;   // a second onCreate (configuration change) keeps the running game
+    JNIEnv *env = act->env;
+    jclass activity_class = (*env)->GetObjectClass(env, act->clazz);
+    if (activity_class) g_audio_menu_method = (*env)->GetMethodID(env, activity_class, "openAudioMenu", "()V");
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (activity_class) (*env)->DeleteLocalRef(env, activity_class);
     snprintf(g_root, sizeof g_root, "%s", act->externalDataPath ? act->externalDataPath : act->internalDataPath);
     char p[700];
     snprintf(p, sizeof p, "%s/log.txt", g_root); char prev[720]; snprintf(prev, sizeof prev, "%s/log.prev.txt", g_root); rename(p, prev);
