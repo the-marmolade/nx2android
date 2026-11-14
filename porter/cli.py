@@ -111,7 +111,55 @@ def _parser():
     for d in (d1, d2, d3):
         d.add_argument('--json', action='store_true')
         if d is not d2: d.add_argument('--package', default='', help='the app (default: the only ported game installed)'); d.add_argument('--device', default='', help='adb serial')
+    lb = sub.add_parser('library', help="the launcher's games: every profile, the games found in the library folders, the ports made, and a rating for a device model")
+    lb.add_argument('--model', default='', help='a device model as adb reports it (e.g. AYN_Thor): the rating is for it')
+    lb.add_argument('--add', action='append', default=[], metavar='FOLDER', help='add a library folder (saved in the config); may repeat')
+    lb.add_argument('--remove', action='append', default=[], metavar='FOLDER', help='remove a library folder; may repeat')
+    lb.add_argument('--art', action='store_true', help="read each owned game's icon and name from its control data (prod.keys; builds nx_extract once), then list")
+    lb.add_argument('--json', action='store_true')
+    la = sub.add_parser('launch', help='start a ported game on the device')
+    la.add_argument('--package', required=True); la.add_argument('--device', default='', help='adb serial'); la.add_argument('--json', action='store_true')
     return ap
+
+
+def cmd_library(a):
+    from porter import library
+    if a.add or a.remove:
+        drop = {os.path.normcase(os.path.abspath(f)) for f in a.remove}
+        library.set_folders([f for f in library.folders() + a.add if os.path.normcase(os.path.abspath(f)) not in drop])
+    art = None
+    if a.art:
+        from porter.upstream import BuildError
+        try: art = library.fetch_art(say=lambda s: print(s, file=sys.stderr if a.json else sys.stdout, flush=True))
+        except (RuntimeError, BuildError, OSError) as e:
+            if a.json: _print_json({'error': f'game art: {e}'})
+            else: print(f'game art: {e}', file=sys.stderr)
+            return 1
+    out = library.library(a.model)
+    if art is not None: out['art'] = art
+    if a.json: _print_json(out); return 0
+    for g in out['games']:
+        if not (g['owned'] or g['ported']): continue
+        print(f'{g["id"]}  {g["rating"]:12} {g["name"]}' + ('  [ported]' if g['ported'] else '') + ('' if not g['scan'] or g['scan']['port_ready'] else '  (share a folder with another game)'))
+    print(f'{sum(g["owned"] for g in out["games"])} owned of {len(out["games"])} · folders: {"; ".join(out["folders"]) or "none (porter library --add FOLDER)"}')
+    return 0
+
+
+def cmd_launch(a):
+    from porter import config, saves, toolchain
+    from porter.adb import AdbError
+    from porter.upstream import BuildError
+    try:
+        cfg = config.load(); adb = saves.connect(toolchain.find_adb(cfg), a.device or cfg.get('device'))
+        r = adb.shell(f'monkey -p {a.package} -c android.intent.category.LAUNCHER 1', check=False)
+        ok = 'No activities found' not in (r or '')
+    except (BuildError, AdbError) as e:
+        if a.json: _print_json({'error': str(e)})
+        else: print(e, file=sys.stderr)
+        return 1
+    if a.json: _print_json({'package': a.package, 'started': ok})
+    else: print(f'{a.package}: ' + ('started' if ok else 'not installed'))
+    return 0 if ok else 1
 
 
 def _romfs_at(p, when=''):   # install's --romfs-at / --romfs-push (porter/install.py)
@@ -370,4 +418,4 @@ STATUS_WORD = {'current': 'up to date', 'update': 'update available', 'risky': '
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver, 'tv': cmd_driver, 'drivers': cmd_drivers}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver, 'updates': cmd_driver, 'tv': cmd_driver, 'drivers': cmd_drivers, 'library': cmd_library, 'launch': cmd_launch}[a.cmd](a)

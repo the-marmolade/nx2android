@@ -13,6 +13,7 @@ KEYS = {
     'out': 'folder for the APK and data pack (empty = the game folder)',
     'device': 'adb serial of the device to install on (empty = the only one connected)',
     'language': 'game language code (empty = English)',
+    'library': 'folders the launcher scans for games (; between them)',
 }
 
 

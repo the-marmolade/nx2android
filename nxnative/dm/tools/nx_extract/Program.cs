@@ -57,6 +57,7 @@ static class P {
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>\n       nx_extract <prod.keys> --sysdata <firmware dir> <title id> <out dir>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
+        if (a[1] == "--control") return ControlOnly(ks, a[2], a[3]);
         if (a[1] == "--sysdata") { if (a.Length < 5) { Console.Error.WriteLine("usage: nx_extract <prod.keys> --sysdata <firmware dir> <title id> <out dir>"); return 2; } return SysData(ks, a[2], Convert.ToUInt64(a[3], 16), a[4]); }
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
@@ -108,6 +109,23 @@ static class P {
         Console.WriteLine($"[RED] the NSP is damaged: " +
                           $"{g_damaged.Count} files fail the NCA's hash check (an incomplete copy or a broken download); copy or download it again, or pass --allow-damaged to write them as read");
         return 3;
+    }
+
+    // Control data only (the launcher's library art, porter/library.py): <out dir>/control.nacp and icon.jpg from a base game NSP or XCI, nothing else read.
+    // An NSZ / XCZ works too when its Control NCA was left uncompressed (.nca beside the .ncz entries, as NSZ leaves small NCAs); exit code 4 when there is none
+    static int ControlOnly(KeySet ks, string nsp, string outDir) {
+        var pkg = OpenNsp(ks, nsp);
+        Nca prog = Pick(pkg, NcaContentType.Program);
+        Nca ctrl = (prog != null ? Pick(pkg, NcaContentType.Control, prog.Header.TitleId) : null) ?? Pick(pkg, NcaContentType.Control);
+        if (ctrl == null) { Console.Error.WriteLine($"[RED] no readable Control NCA in {nsp}"); return 4; }
+        byte[] nacp = Nacp(ctrl);
+        Directory.CreateDirectory(outDir); File.WriteAllBytes(Path.Combine(outDir, "control.nacp"), nacp);
+        Console.WriteLine($"title {ctrl.Header.TitleId:x16}");
+        Console.WriteLine($"name {TitleName(nacp)}");
+        var (icon, lang) = Icon(ctrl);
+        if (icon != null) { File.WriteAllBytes(Path.Combine(outDir, "icon.jpg"), icon); Console.WriteLine($"icon {lang} ({icon.Length} bytes)"); }
+        else Console.WriteLine("no icon in the control data");
+        return 0;
     }
 
     // DLC NSP: one data NCA (content type PublicData / Data) + a meta NCA + the ticket; only the data NCA's RomFS is written
